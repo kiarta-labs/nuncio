@@ -1,0 +1,11 @@
+{
+  "classification_table": {
+    "storage": "common causes and standard fixes for a filesystem or mount failure on Linux",
+    "container": "common causes and standard fixes for a crashed or restarting container",
+    "network": "common causes and standard fixes for host or service connectivity loss",
+    "hardware": "common causes and standard checks for disk, memory, or temperature hardware alerts"
+  },
+  "dependency_hints": {
+    "app": ["app-postgres", "app-redis"]
+  }
+}
