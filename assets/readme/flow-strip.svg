@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 120" role="img" aria-label="Signal path: monitoring, through Nuncio which enriches, correlates and redacts, to your phone or email — with a fail-safe raw-alert path if the LLM is down">
+  <rect x="0" y="0" width="900" height="120" rx="12" fill="#0F1717"/>
+  <g font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
+
+    <!-- fail-safe bypass (drawn first, under the spine) — dips clear below the Nuncio box -->
+    <path d="M 295 58 C 330 104, 570 104, 665 58" fill="none" stroke="#E0A83E" stroke-width="1.2" stroke-dasharray="4,4"/>
+    <path d="M 665 58 L 659.5 65.1 L 656.1 57.9 Z" fill="#E0A83E"/>
+    <text x="450" y="106" text-anchor="middle" font-size="8.5" fill="#E0A83E">LLM down? the raw alert is still delivered — never lost, never late</text>
+
+    <!-- monitoring -->
+    <rect x="48" y="30" width="168" height="36" rx="18" fill="none" stroke="#3A4A46" stroke-width="1.2"/>
+    <text x="132" y="52" text-anchor="middle" font-size="11" fill="#B7C6C1">monitoring</text>
+    <text x="132" y="82" text-anchor="middle" font-size="8" fill="#5E736D">CheckMK · Grafana · Alertmanager · webhook</text>
+
+    <line x1="216" y1="48" x2="322" y2="48" stroke="#45B597" stroke-width="2"/>
+    <path d="M 322 42 L 336 48 L 322 54 Z" fill="#45B597"/>
+
+    <!-- Nuncio -->
+    <rect x="336" y="24" width="228" height="48" rx="10" fill="#14231F" stroke="#45B597" stroke-width="1.4"/>
+    <text x="450" y="42" text-anchor="middle" font-size="9" letter-spacing="2" fill="#45B597">NUNCIO</text>
+    <text x="450" y="58" text-anchor="middle" font-size="10.5" fill="#DDE7E4">enrich · correlate · redact</text>
+
+    <line x1="564" y1="48" x2="670" y2="48" stroke="#45B597" stroke-width="2"/>
+    <path d="M 670 42 L 684 48 L 670 54 Z" fill="#45B597"/>
+
+    <!-- destination -->
+    <rect x="684" y="30" width="168" height="36" rx="18" fill="none" stroke="#3A4A46" stroke-width="1.2"/>
+    <text x="768" y="52" text-anchor="middle" font-size="11" fill="#B7C6C1">your phone · email</text>
+  </g>
+</svg>
