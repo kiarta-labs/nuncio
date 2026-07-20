@@ -1,0 +1,38 @@
+# Example compose file for Nuncio. Copy to docker-compose.yml, adjust the
+# environment block for your setup, and `docker compose up -d`.
+#
+# All configuration is via environment variables -- there is no config baked
+# into the image. NUNCIO_LLM_URL is the only required setting.
+#
+# The dashboard (GET /) has no built-in authentication -- it is a read-only
+# transparency view, but it can still leak alert content to anyone who can
+# reach it. Put Nuncio behind a reverse proxy with auth, or restrict access
+# with an IP allowlist / internal-only network, before exposing it beyond
+# your own machine.
+
+services:
+  nuncio:
+    image: ghcr.io/kiarta-labs/nuncio:latest
+    # or build from source instead: comment the image line and uncomment:
+    # build: .
+    container_name: nuncio
+    restart: unless-stopped
+    ports:
+      - "8095:8095"
+    volumes:
+      - ./data:/data
+      # - ./config.example.json:/config/nuncio.json:ro
+    environment:
+      # Required: any OpenAI-compatible chat-completions endpoint.
+      NUNCIO_LLM_URL: "http://your-llm-gateway:11434/v1"
+      NUNCIO_LLM_MODEL: "your-model"
+      # NUNCIO_LLM_KEY: ""
+
+      # Everything below is optional -- shown here with sane defaults or
+      # commented-out examples. See .env.example / docs/CONFIGURATION.md for
+      # the full reference.
+      NUNCIO_DELIVERY: "stdout"
+      NUNCIO_MODE: "enriched"
+      # NUNCIO_APPRISE_URL: "http://apprise:8000/notify/your-key"
+      # NUNCIO_INGEST_TOKEN: ""   # shared secret required on POST /ingest*
+      # NUNCIO_CONFIG: "/config/nuncio.json"

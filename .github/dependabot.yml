@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Keep the GitHub Actions used in CI and the publish workflow current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Keep the Dockerfile base image (python:X.Y-slim) current.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+# No pip ecosystem: the runtime has zero third-party dependencies, and the dev
+# extras (pytest, pytest-cov) are intentionally unpinned.
