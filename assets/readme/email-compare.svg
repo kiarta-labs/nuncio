@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 620" role="img" aria-label="A raw alert email versus the same alert as an Nuncio-enriched email with evidence sections">
+  <rect x="0" y="0" width="900" height="620" rx="14" fill="#0F1717"/>
+
+  <g font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
+    <!-- column labels -->
+    <text x="165" y="44" text-anchor="middle" font-size="11" font-weight="600" letter-spacing="2" fill="#E0A83E">WITHOUT NUNCIO</text>
+    <text x="165" y="60" text-anchor="middle" font-size="9.5" fill="#77908A">the alert as your monitor sends it</text>
+    <text x="610" y="44" text-anchor="middle" font-size="11" font-weight="600" letter-spacing="2" fill="#45B597">WITH NUNCIO</text>
+    <text x="610" y="60" text-anchor="middle" font-size="9.5" fill="#77908A">the same alert, enriched</text>
+
+    <!-- ===== raw email (small card) ===== -->
+    <rect x="40" y="150" width="250" height="190" rx="10" fill="#131D1B" stroke="#2A3A36"/>
+    <text x="56" y="176" font-size="9.5" fill="#77908A">monitoring@example.internal</text>
+    <text x="274" y="176" text-anchor="end" font-size="9.5" fill="#5E736D">14:02</text>
+    <line x1="56" y1="188" x2="274" y2="188" stroke="#223230"/>
+    <g font-family="ui-monospace,'SF Mono',Menlo,Consolas,monospace">
+      <text x="56" y="212" font-size="10" fill="#C6D2CD"><tspan fill="#E0A83E">[PROBLEM]</tspan> db-primary /</text>
+      <text x="56" y="226" font-size="10" fill="#C6D2CD">PostgreSQL CRITICAL</text>
+      <text x="56" y="254" font-size="9.5" fill="#A8B6B1">FATAL: remaining connection</text>
+      <text x="56" y="268" font-size="9.5" fill="#A8B6B1">slots reserved</text>
+    </g>
+
+    <!-- arrow -->
+    <line x1="304" y1="245" x2="336" y2="245" stroke="#45B597" stroke-width="2"/>
+    <path d="M 336 239 L 350 245 L 336 251 Z" fill="#45B597"/>
+
+    <!-- ===== enriched email ===== -->
+    <rect x="360" y="84" width="500" height="496" rx="12" fill="#131D1B" stroke="#2A3A36"/>
+    <rect x="382" y="99" width="18" height="18" rx="5" fill="#45B597"/>
+    <text x="391" y="113" text-anchor="middle" font-size="12" font-weight="700" font-family="Charter,Georgia,serif" fill="#0F1717">N</text>
+    <text x="408" y="112" font-size="10.5" fill="#9DB0AA">Nuncio · alerts@example.internal</text>
+    <text x="838" y="112" text-anchor="end" font-size="10" fill="#5E736D">Tue 14:02</text>
+
+    <text x="382" y="141" font-size="13.5" font-weight="600" fill="#EDF3F0">❗ db-primary/PostgreSQL — connections exhausted since 14:02</text>
+    <line x1="382" y1="157" x2="838" y2="157" stroke="#223230"/>
+
+    <g font-size="11" fill="#B7C6C1">
+      <text x="382" y="181">PostgreSQL on db-primary hit its connection limit at 14:02 and is</text>
+      <text x="382" y="197">refusing new clients.</text>
+      <text x="382" y="221"><tspan fill="#45B597" font-weight="600">Likely caused by</tspan> a connection leak in the api-gateway pool</text>
+      <text x="382" y="237">(log: "remaining connection slots reserved" <tspan fill="#E0A83E">×47</tspan>).</text>
+      <text x="382" y="261"><tspan fill="#45B597" font-weight="600">Related:</tspan> api-gateway OOM-restart 3 minutes earlier — same incident.</text>
+      <text x="382" y="285"><tspan fill="#45B597" font-weight="600">Next:</tspan> check the api-gateway pool config, run the query below,</text>
+      <text x="382" y="301">confirm the restart cleared it.</text>
+    </g>
+
+    <!-- evidence block -->
+    <rect x="378" y="318" width="464" height="168" rx="8" fill="#0B1311" stroke="#223230"/>
+    <g font-family="ui-monospace,'SF Mono',Menlo,Consolas,monospace">
+      <text x="394" y="343" font-size="8.5" letter-spacing="1.5" fill="#45B597">LOG · db-primary / postgres</text>
+      <text x="394" y="358" font-size="10" fill="#C6D2CD">14:02:11 FATAL: remaining connection slots reserved <tspan fill="#E0A83E">×47</tspan></text>
+      <text x="394" y="386" font-size="8.5" letter-spacing="1.5" fill="#45B597">METRIC</text>
+      <text x="394" y="401" font-size="10" fill="#C6D2CD">pg_connections{host="db-primary"}  <tspan fill="#E0604D">200 / 200 (max)</tspan></text>
+      <text x="394" y="429" font-size="8.5" letter-spacing="1.5" fill="#45B597">CORRELATED</text>
+      <text x="394" y="444" font-size="10" fill="#C6D2CD">13:59:12 api-gateway OOM-kill → container restarted</text>
+      <text x="394" y="459" font-size="9" fill="#77908A">same incident window (−3m)</text>
+    </g>
+
+    <!-- raw footer -->
+    <line x1="382" y1="504" x2="838" y2="504" stroke="#223230"/>
+    <text x="382" y="524" font-size="9" letter-spacing="1.5" fill="#5E736D">RAW ALERT</text>
+    <g font-family="ui-monospace,'SF Mono',Menlo,Consolas,monospace" font-size="9.5" fill="#77908A">
+      <text x="382" y="541">[PROBLEM] db-primary / PostgreSQL — CRITICAL: FATAL: remaining</text>
+      <text x="382" y="555">connection slots reserved</text>
+    </g>
+  </g>
+</svg>
