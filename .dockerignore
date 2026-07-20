@@ -1,0 +1,21 @@
+.git
+.gitignore
+.pytest_cache
+__pycache__
+*.pyc
+
+tests/
+docs/
+docs/internal/
+*.md
+!README.md
+
+# The full-resolution source logo is huge and never shipped in the image;
+# only the pre-sized web assets under nuncio/web/static/ are needed at runtime.
+assets/nuncio-logo-full.png
+
+docker-compose.example.yml
+.env.example
+.env
+
+data/

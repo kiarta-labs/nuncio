@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nuncio"
+dynamic = ["version"]
+description = "A small, deterministic service that enriches monitoring alerts with an LLM summary and forwards them, with a hard fail-safe so an alert is never lost or delayed."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Kirit Gupta" },
+]
+keywords = ["monitoring", "alerting", "llm", "observability", "webhook"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Monitoring",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/kiarta-labs/nuncio"
+Issues = "https://github.com/kiarta-labs/nuncio/issues"
+
+[project.scripts]
+nuncio = "nuncio.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["nuncio*"]
+
+[tool.setuptools.package-data]
+nuncio = ["web/static/*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "nuncio.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["nuncio"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+precision = 0
