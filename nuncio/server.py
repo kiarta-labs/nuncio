@@ -39,6 +39,7 @@ root); `python -m nuncio` (nuncio/__main__.py) wires the two together.
 """
 import hmac
 import json
+import logging
 import queue
 import threading
 import time
@@ -53,6 +54,8 @@ from nuncio.model import categorize, real_host
 from nuncio.redactor import redact
 from nuncio.web import dashboard
 from nuncio.web import settings as settings_ui
+
+log = logging.getLogger("nuncio.server")
 
 _RECEIVED = "received"
 # Phase 5.1: the only values `?severity=` on an ingest URL may set. Anything
@@ -80,14 +83,18 @@ class Metrics:
         self.assist_attempted = 0
         self.assist_ok = 0
         self.assist_failed = 0
+        # Batch 2 item C: dead-letter purge counter -- rows permanently stuck
+        # at status='received' (every maintenance retry exhausted) that got
+        # deleted rather than retried forever.
+        self.purged_stale_received = 0
 
-    def inc(self, attr, key=None):
+    def inc(self, attr, key=None, n=1):
         with self._lock:
             if key is None:
-                setattr(self, attr, getattr(self, attr) + 1)
+                setattr(self, attr, getattr(self, attr) + n)
             else:
                 d = getattr(self, attr)
-                d[key] = d.get(key, 0) + 1
+                d[key] = d.get(key, 0) + n
 
     def render(self):
         with self._lock:
@@ -107,6 +114,7 @@ class Metrics:
             lines.append(f"nuncio_assist_attempted_total {self.assist_attempted}")
             lines.append(f"nuncio_assist_ok_total {self.assist_ok}")
             lines.append(f"nuncio_assist_failed_total {self.assist_failed}")
+            lines.append(f"nuncio_purged_stale_received_total {self.purged_stale_received}")
         return "\n".join(lines) + "\n"
 
 
@@ -162,6 +170,13 @@ class App:
         self.settings = None
         self.boot_effective = {}
         self.q = queue.Queue(maxsize=queue_max)
+        # Batch 2 item C: in-memory per-key backoff for the maintenance
+        # sweep -- key -> (next_retry_at, attempts). No schema change (this
+        # is deliberately NOT persisted: on restart every key is retried
+        # immediately again, which is fine -- the backoff only protects a
+        # single long-running process from hammering a channel that's down).
+        self._maint_backoff = {}
+        self._maint_pass_count = 0
         self._threads = []
         for _ in range(concurrency):
             self._spawn(self._worker)
@@ -324,6 +339,32 @@ class App:
                 self.metrics.queue_depth = self.q.qsize()
                 self.q.task_done()
 
+    # Bounds one pass's undelivered-row sweep so a huge backlog can't starve
+    # this same pass's other duties (assist sweep, purge_delivered, the
+    # dead-letter purge, the periodic WAL checkpoint) -- see item C.
+    _MAINT_SWEEP_LIMIT = 50
+    # Per-key maintenance-delivery backoff: exponential, capped at 1h.
+    _MAINT_BACKOFF_BASE_S = 30.0
+    _MAINT_BACKOFF_CAP_S = 3600.0
+    # PRAGMA wal_checkpoint(TRUNCATE) roughly once every 10 passes.
+    _MAINT_WAL_CHECKPOINT_EVERY = 10
+    # A row still at status='received' this long has exhausted every retry
+    # the sweep offers and is permanently poisoned, not in-flight.
+    _MAINT_STALE_RECEIVED_S = 7 * 86400
+
+    def _maint_backoff_skip(self, key, now):
+        until = self._maint_backoff.get(key)
+        return until is not None and now < until[0]
+
+    def _maint_backoff_bump(self, key, now):
+        _, attempts = self._maint_backoff.get(key, (0.0, 0))
+        attempts += 1
+        delay = min(self._MAINT_BACKOFF_CAP_S, self._MAINT_BACKOFF_BASE_S * (2 ** (attempts - 1)))
+        self._maint_backoff[key] = (now + delay, attempts)
+
+    def _maint_backoff_clear(self, key):
+        self._maint_backoff.pop(key, None)
+
     def _maintenance(self):
         """Safety net: deliver-as-raw any undelivered row past its deadline.
         First pass = startup drain -- uses an age-0 cutoff (ALL `received`
@@ -343,48 +384,95 @@ class App:
         second, independent line of defense for the same race (this cutoff
         fix removes the common case; the belt catches anything this cutoff
         alone can't, e.g. a worker that's unusually slow for reasons outside
-        its own deadline accounting)."""
+        its own deadline accounting).
+
+        Batch 2 item C hardening: every duty below is isolated in its own
+        try/except so a failure in one (e.g. the undelivered-rows fetch
+        itself, not just a single poisoned row) can never starve the others
+        in the same pass. A repeatedly-failing key backs off exponentially
+        instead of being retried every single pass; rows dead-lettered at
+        'received' past a week are purged with a warning; the WAL is
+        checkpointed periodically."""
         first_pass = True
         while True:
+            self._maint_pass_count += 1
+            if first_pass:
+                cutoff = self.wall_clock()
+                first_pass = False
+            else:
+                cutoff = self.wall_clock() - (max(self.budget_s, self.full_budget_s) + self.maint_margin)
+
             try:
-                if first_pass:
-                    cutoff = self.wall_clock()
-                    first_pass = False
-                else:
-                    cutoff = self.wall_clock() - (max(self.budget_s, self.full_budget_s) + self.maint_margin)
-                for key, raw in self.store.undelivered_older_than(cutoff):
-                    # Per-row isolation: undelivered_older_than() returns
-                    # rows OLDEST-FIRST, so a single poisoned row that always
-                    # raises must never abort the rest of the pass -- else
-                    # that same row re-fails every cycle and permanently
-                    # stalls recovery of every row after it. Mirrors
-                    # Engine.drain_raw's try/except:continue.
-                    try:
-                        outcome = self.engine._deliver_raw(key, raw, fail_stage="queue")
-                        if outcome == "raw":
-                            self.metrics.inc("recovered")
-                        elif outcome == "skipped_duplicate":
-                            # BLOCKER 2b belt fired -- the worker already (or
-                            # concurrently) delivered this key; not a
-                            # failure, not a recovery, just a race avoided.
-                            self.metrics.inc("duplicates_avoided")
-                    except Exception:
-                        self.metrics.inc("failures", "maintenance")
-                        continue
-                # Batch C: restart/orphan sweep for the assist plane's rich-
-                # delivery leg -- a row stuck at assist_status='deferred'
-                # past its own timeout (e.g. the process crashed with items
-                # still on the assist worker's in-memory queue). A no-op
-                # when the assist plane is disabled or has nothing pending.
-                assist = getattr(self.engine, "assist", None)
-                if assist is not None:
-                    try:
-                        assist.sweep_orphans()
-                    except Exception:
-                        self.metrics.inc("failures", "maintenance")
+                rows = self.store.undelivered_older_than(cutoff, limit=self._MAINT_SWEEP_LIMIT)
+            except Exception:
+                rows = ()
+                self.metrics.inc("failures", "maintenance")
+
+            now = self.wall_clock()
+            for key, raw in rows:
+                # Per-row isolation: undelivered_older_than() returns rows
+                # OLDEST-FIRST, so a single poisoned row that always raises
+                # must never abort the rest of the pass -- else that same
+                # row re-fails every cycle and permanently stalls recovery
+                # of every row after it. Mirrors Engine.drain_raw's
+                # try/except:continue.
+                if self._maint_backoff_skip(key, now):
+                    continue
+                try:
+                    outcome = self.engine._deliver_raw(key, raw, fail_stage="queue")
+                    if outcome == "raw":
+                        self.metrics.inc("recovered")
+                        self._maint_backoff_clear(key)
+                    elif outcome == "skipped_duplicate":
+                        # BLOCKER 2b belt fired -- the worker already (or
+                        # concurrently) delivered this key; not a failure,
+                        # not a recovery, just a race avoided.
+                        self.metrics.inc("duplicates_avoided")
+                        self._maint_backoff_clear(key)
+                    else:
+                        self._maint_backoff_bump(key, now)
+                except Exception:
+                    self.metrics.inc("failures", "maintenance")
+                    self._maint_backoff_bump(key, now)
+                    continue
+
+            # Batch C: restart/orphan sweep for the assist plane's rich-
+            # delivery leg -- a row stuck at assist_status='deferred' past
+            # its own timeout (e.g. the process crashed with items still on
+            # the assist worker's in-memory queue). A no-op when the assist
+            # plane is disabled or has nothing pending. Isolated so a
+            # failure here (or above, fetching rows) never blocks the
+            # duties below.
+            assist = getattr(self.engine, "assist", None)
+            if assist is not None:
+                try:
+                    assist.sweep_orphans()
+                except Exception:
+                    self.metrics.inc("failures", "maintenance")
+
+            try:
                 self.store.purge_delivered(self.wall_clock() - self.retention_s)
             except Exception:
                 self.metrics.inc("failures", "maintenance")
+
+            try:
+                purged = self.store.purge_stale_received(self.wall_clock() - self._MAINT_STALE_RECEIVED_S)
+                if purged:
+                    log.warning(
+                        "purged %d alert(s) permanently stuck at status='received' "
+                        "(older than %ds -- every maintenance retry exhausted)",
+                        purged, self._MAINT_STALE_RECEIVED_S,
+                    )
+                    self.metrics.inc("purged_stale_received", n=purged)
+            except Exception:
+                self.metrics.inc("failures", "maintenance")
+
+            if self._maint_pass_count % self._MAINT_WAL_CHECKPOINT_EVERY == 0:
+                try:
+                    self.store.wal_checkpoint()
+                except Exception:
+                    self.metrics.inc("failures", "maintenance")
+
             time.sleep(self.maint_interval)
 
 
