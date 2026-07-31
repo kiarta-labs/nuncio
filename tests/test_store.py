@@ -188,6 +188,78 @@ def test_undelivered_older_than_excludes_delivered():
     s.close()
 
 
+def test_undelivered_older_than_respects_limit():
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    s.persist("k1", "p1")
+    s.persist("k2", "p2")
+    s.persist("k3", "p3")
+    wall.t = 2000.0
+    stale = s.undelivered_older_than(1999.0, limit=2)
+    assert len(stale) == 2
+    s.close()
+
+
+def test_undelivered_older_than_limit_keeps_oldest_first_order():
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    s.persist("k1", "p1")
+    wall.t = 1001.0
+    s.persist("k2", "p2")
+    wall.t = 1002.0
+    s.persist("k3", "p3")
+    wall.t = 2000.0
+    stale = s.undelivered_older_than(1999.0, limit=2)
+    assert [k for k, _ in stale] == ["k1", "k2"]
+    s.close()
+
+
+def test_undelivered_older_than_no_limit_returns_everything():
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    for i in range(5):
+        s.persist(f"k{i}", "p")
+    wall.t = 2000.0
+    stale = s.undelivered_older_than(1999.0)
+    assert len(stale) == 5
+    s.close()
+
+
+def test_purge_stale_received_removes_only_old_received_rows():
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    s.persist("ancient_stuck", "p")  # created_at=1000, stays 'received' forever
+    wall.t = 5000.0
+    s.persist("recent_stuck", "p")  # created_at=5000, also 'received'
+    s.persist("old_delivered", "p")
+    s.mark_delivered("old_delivered", "raw")  # not 'received' -- must survive
+    removed = s.purge_stale_received(cutoff=2000.0)
+    assert removed == 1
+    assert s.get_status("ancient_stuck") is None
+    assert s.get_status("recent_stuck") == "received"
+    assert s.get_status("old_delivered") == "delivered_raw"
+    s.close()
+
+
+def test_purge_stale_received_returns_zero_when_nothing_qualifies():
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    s.persist("fresh", "p")
+    assert s.purge_stale_received(cutoff=500.0) == 0
+    s.close()
+
+
+def test_wal_checkpoint_runs_without_error():
+    # No behavioral assertion beyond "doesn't raise" -- WAL mode is on
+    # (see Store.__init__), so PRAGMA wal_checkpoint(TRUNCATE) is a valid,
+    # meaningful operation; this just proves the method exists and works
+    # against a real connection.
+    s = Store(":memory:")
+    s.persist("k1", "p")
+    s.wal_checkpoint()  # must not raise
+    s.close()
+
+
 def test_purge_delivered_removes_old_delivered_only():
     wall = FakeWall(1000.0)
     s = Store(":memory:", clock=wall)

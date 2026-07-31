@@ -1190,6 +1190,169 @@ def test_metrics_render_includes_duplicates_avoided():
     assert "nuncio_duplicates_avoided_total 3" in m.render()
 
 
+# --- Batch 2 item C: maintenance hardening ---
+
+def test_maintenance_undelivered_sweep_is_bounded_by_a_limit(tmp_path):
+    # A huge backlog must not let one pass's row-by-row delivery loop starve
+    # the assist sweep / purge_delivered / dead-letter purge that come after
+    # it in the same pass -- capping the sweep keeps a pass's worst-case
+    # duration bounded.
+    store = Store(str(tmp_path / "maint_limit.db"))
+    calls = []
+    orig = store.undelivered_older_than
+
+    def spy(cutoff, limit=None):
+        calls.append(limit)
+        return orig(cutoff, limit=limit)
+
+    store.undelivered_older_than = spy
+
+    a = App(FakeEngine(), store, Metrics(), budget_s=45.0, concurrency=0, queue_max=5,
+            clock=lambda: 1000.0, wall_clock=lambda: 1000.0, maint_interval=3600.0)
+    try:
+        assert _wait_until(lambda: len(calls) >= 1)
+        assert calls[0] == 50
+    finally:
+        store.close()
+
+
+def test_maintenance_assist_and_purge_still_run_when_undelivered_fetch_raises(tmp_path):
+    # BEFORE this fix: an exception raised while FETCHING the undelivered
+    # rows (as opposed to a single poisoned row, already isolated) aborted
+    # the rest of the pass -- the assist sweep and purge_delivered never got
+    # a chance to run that cycle. Each duty must be independently isolated.
+    store = Store(str(tmp_path / "maint_starve.db"))
+    store.undelivered_older_than = lambda cutoff, limit=None: (_ for _ in ()).throw(RuntimeError("fetch broke"))
+
+    class RecordingAssist:
+        def __init__(self):
+            self.swept = 0
+
+        def sweep_orphans(self):
+            self.swept += 1
+
+    class EngineWithAssist:
+        mode = "enriched"
+
+        def __init__(self):
+            self.assist = RecordingAssist()
+
+    eng = EngineWithAssist()
+    a = App(eng, store, Metrics(), budget_s=45.0, concurrency=0, queue_max=5,
+            clock=lambda: 1000.0, wall_clock=lambda: 1000.0, maint_interval=3600.0)
+    try:
+        assert _wait_until(lambda: eng.assist.swept >= 1)
+        assert _wait_until(lambda: a.metrics.failures.get("maintenance", 0) >= 1)
+    finally:
+        store.close()
+
+
+def test_maintenance_backs_off_a_repeatedly_failing_key(tmp_path):
+    # After a failed maintenance delivery, the same key must be skipped for
+    # a while rather than retried every single pass (a permanently-broken
+    # channel would otherwise burn a full retry storm every maint_interval).
+    store = Store(str(tmp_path / "maint_backoff.db"), clock=lambda: 1000.0)
+    store.persist("checkmk:host01/svc/1/PROBLEM/1", "raw payload")
+
+    attempts = []
+
+    class FailingEngine:
+        mode = "enriched"
+        assist = None
+
+        def _deliver_raw(self, key, raw, fail_stage=None):
+            attempts.append(1)
+            return "delivery_failed"
+
+    wall = {"t": 2000.0}
+    a = App(FailingEngine(), store, Metrics(), budget_s=1.0, concurrency=0, queue_max=5,
+            clock=lambda: 1000.0, wall_clock=lambda: wall["t"], maint_interval=0.03)
+    try:
+        assert _wait_until(lambda: len(attempts) >= 1)
+        first_count = len(attempts)
+        # Several more passes elapse at the SAME wall-clock instant -- the
+        # backoff window (which started counting from `first_count`'s
+        # attempt) must suppress every one of them.
+        time.sleep(0.15)
+        assert len(attempts) == first_count  # no new attempt while backed off
+    finally:
+        store.close()
+
+
+def test_maintenance_backoff_clears_on_success(tmp_path):
+    # A key that eventually succeeds must not stay backed off forever --
+    # the backoff bookkeeping is per-key and clears on a non-failure outcome.
+    store = Store(str(tmp_path / "maint_backoff_clear.db"), clock=lambda: 1000.0)
+    store.persist("checkmk:host01/svc/1/PROBLEM/1", "raw payload")
+
+    class RecoveringEngine:
+        mode = "enriched"
+        assist = None
+
+        def _deliver_raw(self, key, raw, fail_stage=None):
+            return "raw"
+
+    a = App(RecoveringEngine(), store, Metrics(), budget_s=1.0, concurrency=0, queue_max=5,
+            clock=lambda: 1000.0, wall_clock=lambda: time.time() + 10 ** 6, maint_interval=3600.0)
+    try:
+        assert _wait_until(lambda: a.metrics.recovered == 1)
+        assert a._maint_backoff == {}
+    finally:
+        store.close()
+
+
+def test_maintenance_purges_dead_letter_rows_stuck_at_received(tmp_path):
+    store = Store(str(tmp_path / "maint_deadletter.db"), clock=lambda: 1000.0)
+    store.persist("checkmk:host01/svc/ancient/PROBLEM/1", "raw payload")
+
+    class NoopEngine:
+        mode = "enriched"
+        assist = None
+
+        def _deliver_raw(self, key, raw, fail_stage=None):
+            return "delivery_failed"  # never actually clears the row
+
+    eight_days_s = 8 * 86400
+    a = App(NoopEngine(), store, Metrics(), budget_s=1.0, concurrency=0, queue_max=5,
+            clock=lambda: 1000.0, wall_clock=lambda: 1000.0 + eight_days_s, maint_interval=3600.0)
+    try:
+        assert _wait_until(lambda: store.get_status("checkmk:host01/svc/ancient/PROBLEM/1") is None)
+        assert a.metrics.purged_stale_received == 1
+    finally:
+        store.close()
+
+
+def test_maintenance_runs_wal_checkpoint_periodically(tmp_path):
+    store = Store(str(tmp_path / "maint_wal.db"))
+    calls = []
+    orig = store.wal_checkpoint
+
+    def spy():
+        calls.append(1)
+        return orig()
+
+    store.wal_checkpoint = spy
+    a = App(FakeEngine(), store, Metrics(), budget_s=45.0, concurrency=0, queue_max=5,
+            clock=lambda: 1000.0, wall_clock=lambda: 1000.0, maint_interval=0.01)
+    try:
+        assert _wait_until(lambda: len(calls) >= 1, timeout=3.0)
+    finally:
+        store.close()
+
+
+def test_maintenance_wal_checkpoint_failure_does_not_kill_the_thread(tmp_path):
+    store = Store(str(tmp_path / "maint_wal_boom.db"))
+    store.wal_checkpoint = lambda: (_ for _ in ()).throw(RuntimeError("checkpoint broke"))
+    a = App(FakeEngine(), store, Metrics(), budget_s=45.0, concurrency=0, queue_max=5,
+            clock=lambda: 1000.0, wall_clock=lambda: 1000.0, maint_interval=0.01)
+    try:
+        assert _wait_until(lambda: a.healthy(), timeout=1.0)
+        time.sleep(0.1)
+        assert a.healthy()
+    finally:
+        store.close()
+
+
 def test_maintenance_survives_outer_exception_and_keeps_looping(tmp_path, monkeypatch):
     store = Store(str(tmp_path / "maint4.db"))
     monkeypatch.setattr(store, "undelivered_older_than",

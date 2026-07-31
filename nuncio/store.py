@@ -354,16 +354,19 @@ class Store:
             ).fetchall()
         return [tuple(r) for r in rows]
 
-    def undelivered_older_than(self, cutoff):
+    def undelivered_older_than(self, cutoff, limit=None):
         """(key, payload) for undelivered rows created before `cutoff` (epoch),
         oldest first — the age-based safety net for stuck/queued-past-deadline
-        alerts."""
+        alerts. `limit` (None = unlimited) bounds a single sweep pass -- the
+        maintenance loop uses a bounded limit so one pass with a huge backlog
+        can't starve its other per-pass duties (assist sweep, purge)."""
+        sql = "SELECT key, payload FROM alerts WHERE status = ? AND created_at < ? ORDER BY seq"
+        params = [_STATUS_RECEIVED, cutoff]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT key, payload FROM alerts "
-                "WHERE status = ? AND created_at < ? ORDER BY seq",
-                (_STATUS_RECEIVED, cutoff),
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return [(k, p) for k, p in rows]
 
     # Terminal statuses this store knows about:
@@ -449,6 +452,30 @@ class Store:
             )
             self._conn.commit()
             return cur.rowcount
+
+    def purge_stale_received(self, cutoff):
+        """Delete rows still at status='received' (never delivered, never
+        marked delivered) created before `cutoff` (epoch). A row this old
+        that's still 'received' has already been through every retry the
+        maintenance sweep offers and never succeeded -- it's a permanently
+        poisoned/dead-letter row, not a legitimately in-flight one. Returns
+        rows removed."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM alerts WHERE status = ? AND created_at < ?",
+                (_STATUS_RECEIVED, cutoff),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def wal_checkpoint(self):
+        """Force a WAL checkpoint (TRUNCATE mode -- resets the WAL file to
+        zero bytes after copying its contents back into the main db file).
+        SQLite auto-checkpoints periodically, but a busy long-running writer
+        can let the WAL file grow unbounded between auto-checkpoints; the
+        maintenance loop calls this periodically as a backstop."""
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def close(self):
         with self._lock:
