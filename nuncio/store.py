@@ -279,6 +279,29 @@ class Store:
         first_seen = row[1] if row and row[1] is not None else None
         return count, first_seen
 
+    def fingerprint_deliveries(self, fp, window_s, now=None):
+        """(created_at, severity) for DELIVERED rows sharing fingerprint
+        `fp` within the backward window `[now-window_s, now]`, oldest
+        first -- the flap-suppression feature's per-fingerprint delivery
+        history (see nuncio.engine.Engine._flap_decision).
+
+        "Delivered" means `outcome` is 'enriched' or 'raw' -- a row that
+        hasn't been delivered yet (outcome NULL, still queued/in-flight) or
+        that was itself a flap-suppressed repeat ('suppressed_flap') is
+        excluded: a suppressed row was never actually a distinct
+        problem/ok delivery, so it must not feed back into future
+        flap-cycle counting. `now` defaults to wall-clock time."""
+        now = self._clock() if now is None else now
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT created_at, severity FROM alerts "
+                "WHERE fingerprint = ? AND created_at >= ? AND created_at <= ? "
+                "AND outcome IN ('enriched', 'raw') AND key NOT LIKE ? "
+                "ORDER BY created_at ASC",
+                (fp, now - window_s, now, CANARY_PREFIX + "%"),
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     def claim_assist(self, key):
         """Atomic CAS claim of `key` for the assist worker, moving
         `assist_status` to `'in_flight'` -- but ONLY if it is still
@@ -377,7 +400,12 @@ class Store:
     # ALTER TABLE migrations) purely for historical/audit continuity with
     # rows written before the delivery-mode collapse; nothing in this build
     # writes to `raw_first_fired` anymore.
-    _MARK_MODES = ("enriched", "raw")
+    # "suppressed_flap" (Batch 2 item G): a flap-suppressed repeat is a
+    # TERMINAL state -- persisted and auditable, but never delivered and
+    # never eligible for the maintenance safety net's raw fallback (it must
+    # not be picked up by undelivered_older_than, which only selects
+    # status == 'received').
+    _MARK_MODES = ("enriched", "raw", "suppressed_flap")
 
     def mark_delivered(self, key, mode):
         """mode in _MARK_MODES -> status delivered_<mode>."""

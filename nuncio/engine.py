@@ -149,6 +149,38 @@ class _Fallback(Exception):
     """Internal signal to drop to the raw-delivery path."""
 
 
+# --- Batch 2 item G: flap suppression -----------------------------------
+
+_FLAP_SUPPRESS = object()  # sentinel: _flap_decision says "suppress this alert"
+
+
+def _flap_class(severity):
+    """Binary flap-classification bucket: "ok" for a recovery/info
+    lifecycle state, "problem" for everything else (mirrors
+    nuncio.model.disposition's two-way split, collapsing "recovery" and
+    "info" into one "ok" bucket -- the flap semantics only care about
+    "is this currently a problem or not", not the finer disposition
+    distinction that only matters for enrichment framing)."""
+    return "ok" if disposition(severity) != "problem" else "problem"
+
+
+def _ordinal(n):
+    if 10 <= (n % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _dur_label(seconds):
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}h"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
 class Engine:
     def __init__(self, store, llm, delivery,
                  redact_fn=redact, build_messages_fn=build_level_a_messages,
@@ -160,7 +192,8 @@ class Engine:
                  router=None, knowledge_llm=None,
                  fingerprint_window_s=172800, evidence_max_bytes=32000,
                  assist=None, enrich_format="auto",
-                 depth="full", full_budget_s=60.0):
+                 depth="full", full_budget_s=60.0,
+                 flap_threshold=0, flap_window_s=10800, flap_cooldown_s=3600):
         if mode not in VALID_MODES:
             raise ValueError(f"invalid NUNCIO_MODE: {mode!r}; must be one of {VALID_MODES}")
         if enrich_format not in VALID_ENRICH_FORMATS:
@@ -214,6 +247,11 @@ class Engine:
         # somewhere to write a live change, see nuncio.config.apply_changes).
         self.depth = depth
         self.full_budget_s = full_budget_s
+        # Batch 2 item G: flap suppression. 0 (default) disables it
+        # entirely -- see `_flap_decision`.
+        self.flap_threshold = flap_threshold
+        self.flap_window_s = flap_window_s
+        self.flap_cooldown_s = flap_cooldown_s
 
     def process(self, key, alert, raw_text, deadline=None, mode=None, depth=None):
         """Enrich + deliver one already-persisted alert. Returns
@@ -251,6 +289,12 @@ class Engine:
             deadline = Deadline(self.budget_s, clock=self._clock)
         effective_mode = mode if mode is not None else self.mode
         effective_depth = depth if depth is not None else self.depth
+        # Batch 2 item G: flap suppression -- checked before anything else
+        # (enrichment, bypass) so a suppressed repeat never runs an LLM call
+        # or a delivery attempt at all, just a terminal store write.
+        flap_note = self._flap_decision(alert, (alert or {}).get("severity") or "unknown")
+        if flap_note is _FLAP_SUPPRESS:
+            return self._suppress_flap(key)
         if effective_mode == "bypass":
             return self._deliver_raw(key, raw_text, marker=False, alert=alert)
         try:
@@ -322,6 +366,12 @@ class Engine:
                 # addendum the knowledge plane may append after it.
                 enrichment = f"{enrichment.rstrip()}\n\n(severity inferred, not reported by the source)"
             enrichment = self._garnish_with_knowledge(alert, enrichment, deadline, effective_depth)
+            if flap_note:
+                # Appended LAST (after the knowledge garnish) -- this is a
+                # delivery-level annotation about the alert's flapping
+                # pattern, not about the analysis itself, so it trails
+                # everything else rather than being buried mid-detail.
+                enrichment = f"{enrichment.rstrip()}\n\n{flap_note}"
             recurrence_count, window_label = self._recurrence_suffix(alert)
             sections_red = meta.get("sections_red") or {}
             # Mask secrets in the embedded raw — it egresses to the notification
@@ -343,7 +393,8 @@ class Engine:
             return self._deliver_enriched(key, alert, envelope, sections_red, enrichment, usage, meta)
         except Exception as e:
             # ANY failure (LLM, validation, deadline, internal) -> raw + marker.
-            return self._deliver_raw(key, raw_text, fail_stage=self._classify_failure(e), alert=alert)
+            raw_with_note = f"{raw_text.rstrip()}\n\n{flap_note}" if flap_note else raw_text
+            return self._deliver_raw(key, raw_with_note, fail_stage=self._classify_failure(e), alert=alert)
 
     def _delivery_has_verbosity(self, verbosity):
         """Duck-typed `self.delivery.has_verbosity(verbosity)` -- see the
@@ -526,6 +577,80 @@ class Engine:
         return n
 
     # --- internals ---
+
+    def _flap_decision(self, alert, severity):
+        """Flap-suppression decision for `alert` (whose fingerprint groups
+        it with its own history -- see nuncio.fingerprint, NEVER rendered
+        text; that grouping choice is a known limitation for sources like
+        CheckMK whose problem/recovery `output` text differs enough that
+        the two can land on different fingerprints -- see this method's
+        call site in `process()`).
+
+        Returns `_FLAP_SUPPRESS` (caller must persist this alert as
+        outcome='suppressed_flap' and skip delivery entirely), a note
+        string to append to the delivered message (this delivery IS the
+        trigger), or None (nothing to do). Fails OPEN on any exception --
+        this feature must never be able to block or alter normal delivery.
+
+        Algorithm: fetch this fingerprint's DELIVERED history within
+        `flap_window_s`, oldest-first, classify each as "problem"/"ok" (see
+        `_flap_class`), and collapse consecutive duplicate classes into one
+        (two problem deliveries in a row with no recovery between them is
+        one state, not two -- mirrors nuncio.web.dashboard._flap_cycles'
+        identical collapsing discipline). The collapsed sequence is by
+        construction strictly alternating, so its running length IS the
+        count of "deliveries with alternating dispositions" the threshold
+        counts against. If some prior (already-delivered) entry's running
+        length already reached `flap_threshold` and that entry is still
+        within `flap_cooldown_s` of now, we're in an active cooldown ->
+        suppress. Otherwise, if appending THIS alert (after the same
+        duplicate-collapse rule) brings the running length to
+        >= `flap_threshold`, this delivery is the trigger -> return the
+        note. A quiet history (nothing prior in the window) can never
+        reach the threshold on its own, so the first problem after a quiet
+        window is never suppressed."""
+        if self.flap_threshold <= 0:
+            return None
+        try:
+            fp = compute_fingerprint(alert)
+            if not fp:
+                return None
+            now = self._wall_clock()
+            history = self.store.fingerprint_deliveries(fp, self.flap_window_s, now=now)
+            collapsed = []  # [(created_at, class), ...], no consecutive duplicate classes
+            for created_at, sev in history:
+                cls = _flap_class(sev)
+                if not collapsed or collapsed[-1][1] != cls:
+                    collapsed.append((created_at, cls))
+            last_trigger_at = None
+            for i, (created_at, _cls) in enumerate(collapsed):
+                if i + 1 >= self.flap_threshold:
+                    last_trigger_at = created_at
+            if last_trigger_at is not None and (now - last_trigger_at) < self.flap_cooldown_s:
+                return _FLAP_SUPPRESS
+            prev_cls = collapsed[-1][1] if collapsed else None
+            run_len = len(collapsed)
+            current_cls = _flap_class(severity)
+            if prev_cls is None or current_cls != prev_cls:
+                run_len += 1
+            if run_len >= self.flap_threshold:
+                return (f"(flapping — {_ordinal(run_len)} cycle in {_dur_label(self.flap_window_s)}; "
+                        f"suppressing repeats for {_dur_label(self.flap_cooldown_s)})")
+            return None
+        except Exception:
+            return None
+
+    def _suppress_flap(self, key):
+        """Persist `key` as a terminal, undelivered flap-suppressed repeat.
+        Best-effort: the row is already durably 'received' from persist();
+        a failure here only risks the maintenance safety net eventually
+        delivering it raw instead (the never-lose invariant still holds)."""
+        try:
+            self.store.mark_delivered(key, "suppressed_flap")
+            self.store.record_stats(key, outcome="suppressed_flap")
+        except Exception:
+            pass
+        return "suppressed_flap"
 
     def _recurrence_suffix(self, alert):
         """(count, window_label) for the headline's recurrence suffix --

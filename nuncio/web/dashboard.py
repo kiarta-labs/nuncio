@@ -193,9 +193,19 @@ def _derive_host_service(row):
 
 def _subject(row):
     """Human-facing "subject" for an alert row: host/service when both are
-    known, else whichever one is, else the payload's/key's own text, else an
-    em dash (only truly impossible for a persisted row). Pure string
-    formatting, no I/O."""
+    known, else whichever one is, else the row's fingerprint (a stable
+    per-signature identity -- see nuncio.fingerprint), else the payload's/
+    key's own text, else an em dash (only truly impossible for a persisted
+    row). Pure string formatting, no I/O.
+
+    Fingerprint is checked BEFORE the payload-first-line fallback: a
+    problem notification and its recovery for the very same underlying
+    alert routinely render completely different payload text (e.g.
+    "CRITICAL - service down" vs "OK - service recovered"), so grouping by
+    payload text split them into different subjects and flap-cycle
+    detection (nuncio.web.dashboard._flap_cycles, which needs both the
+    problem and recovery rows in ONE group) never fired for a row lacking
+    host/service columns -- flapping_subjects stayed 0."""
     host, service = _derive_host_service(row)
     if host and service:
         return f"{host}/{service}"
@@ -203,6 +213,9 @@ def _subject(row):
         return host
     if service:
         return service
+    fp = row.get("fingerprint")
+    if fp:
+        return fp
     payload = row.get("payload") or ""
     if payload:
         return payload.splitlines()[0][:80]

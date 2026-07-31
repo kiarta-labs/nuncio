@@ -514,6 +514,42 @@ def test_delivery_timeout_and_retries_default():
     assert s.NUNCIO_DELIVERY_RETRIES == 3
 
 
+def test_flap_settings_default_disabled():
+    s = config.load_settings(base_env())
+    assert s.NUNCIO_FLAP_THRESHOLD == 0
+    assert s.NUNCIO_FLAP_WINDOW_S == 10800
+    assert s.NUNCIO_FLAP_COOLDOWN_S == 3600
+
+
+def test_build_app_wires_flap_settings_into_the_engine(tmp_path):
+    s_env = base_env(
+        NUNCIO_DATA_DIR=str(tmp_path), NUNCIO_FLAP_THRESHOLD="5",
+        NUNCIO_FLAP_WINDOW_S="7200", NUNCIO_FLAP_COOLDOWN_S="1800",
+    )
+    app, settings = config.build_app(config.load_settings(s_env))
+    try:
+        assert app.engine.flap_threshold == 5
+        assert app.engine.flap_window_s == 7200
+        assert app.engine.flap_cooldown_s == 1800
+    finally:
+        app.store.close()
+
+
+def test_apply_changes_live_updates_flap_settings(tmp_path):
+    s_env = base_env(NUNCIO_DATA_DIR=str(tmp_path))
+    app, settings = config.build_app(config.load_settings(s_env))
+    try:
+        result = config.apply_changes(app, {
+            "NUNCIO_FLAP_THRESHOLD": "4", "NUNCIO_FLAP_WINDOW_S": "9000", "NUNCIO_FLAP_COOLDOWN_S": "1200",
+        })
+        assert set(result["applied"]) == {"NUNCIO_FLAP_THRESHOLD", "NUNCIO_FLAP_WINDOW_S", "NUNCIO_FLAP_COOLDOWN_S"}
+        assert app.engine.flap_threshold == 4
+        assert app.engine.flap_window_s == 9000
+        assert app.engine.flap_cooldown_s == 1200
+    finally:
+        app.store.close()
+
+
 # --- LOW: Dispatch's contract is "return bool, never raise" ---
 
 def test_dispatch_returns_false_not_raise_on_adapter_exception():

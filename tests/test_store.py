@@ -67,6 +67,15 @@ def test_mark_delivered_raw_updates_status(store):
     assert store.get_status("k1") == "delivered_raw"
 
 
+def test_mark_delivered_suppressed_flap_updates_status(store):
+    # Batch 2 item G: a flap-suppressed alert is a TERMINAL state (never
+    # delivered, but never eligible for the maintenance safety net's raw
+    # fallback either) -- reuses the same delivered_<mode> status naming.
+    store.persist("k1", "p")
+    store.mark_delivered("k1", "suppressed_flap")
+    assert store.get_status("k1") == "delivered_suppressed_flap"
+
+
 def test_undelivered_returns_received_not_yet_delivered(store):
     store.persist("k1", "p1")
     store.persist("k2", "p2")
@@ -246,6 +255,62 @@ def test_purge_stale_received_returns_zero_when_nothing_qualifies():
     s = Store(":memory:", clock=wall)
     s.persist("fresh", "p")
     assert s.purge_stale_received(cutoff=500.0) == 0
+    s.close()
+
+
+# --- Batch 2 item G: fingerprint_deliveries (flap-suppression history) ---
+
+def test_fingerprint_deliveries_returns_only_delivered_rows_oldest_first():
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    s.persist("k1", "p", fingerprint="fp1", severity="warning")
+    s.record_stats("k1", outcome="enriched")
+    wall.t = 1001.0
+    s.persist("k2", "p", fingerprint="fp1", severity="ok")
+    s.record_stats("k2", outcome="raw")
+    wall.t = 1002.0
+    s.persist("k3", "p", fingerprint="fp1", severity="warning")  # never delivered -- outcome NULL
+    rows = s.fingerprint_deliveries("fp1", window_s=10000, now=2000.0)
+    assert [sev for _, sev in rows] == ["warning", "ok"]
+    assert rows[0][0] < rows[1][0]  # oldest first
+    s.close()
+
+
+def test_fingerprint_deliveries_excludes_suppressed_flap_rows():
+    # A row already recorded as a flap-suppressed repeat is not itself a
+    # "delivery" -- it must not feed back into future flap-cycle counting.
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    s.persist("k1", "p", fingerprint="fp1", severity="warning")
+    s.mark_delivered("k1", "suppressed_flap")
+    s.record_stats("k1", outcome="suppressed_flap")
+    rows = s.fingerprint_deliveries("fp1", window_s=10000, now=2000.0)
+    assert rows == []
+    s.close()
+
+
+def test_fingerprint_deliveries_respects_the_window():
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    s.persist("old", "p", fingerprint="fp1", severity="warning")
+    s.record_stats("old", outcome="enriched")
+    wall.t = 5000.0
+    s.persist("new", "p", fingerprint="fp1", severity="ok")
+    s.record_stats("new", outcome="raw")
+    rows = s.fingerprint_deliveries("fp1", window_s=1000, now=5000.0)
+    assert [sev for _, sev in rows] == ["ok"]  # "old" (created_at=1000) is outside the window
+    s.close()
+
+
+def test_fingerprint_deliveries_only_matches_the_given_fingerprint():
+    wall = FakeWall(1000.0)
+    s = Store(":memory:", clock=wall)
+    s.persist("k1", "p", fingerprint="fp1", severity="warning")
+    s.record_stats("k1", outcome="enriched")
+    s.persist("k2", "p", fingerprint="fp2", severity="warning")
+    s.record_stats("k2", outcome="enriched")
+    rows = s.fingerprint_deliveries("fp1", window_s=10000, now=2000.0)
+    assert len(rows) == 1
     s.close()
 
 
