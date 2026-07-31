@@ -1,5 +1,6 @@
 """Context gatherer — category-based collector selection, concurrent
 execution with a total timeout, degrade-on-slow, bundle assembly."""
+import threading
 import time
 from nuncio.gatherer import Gatherer, categorize
 from nuncio.collectors import UNAVAIL
@@ -92,6 +93,39 @@ def test_empty_streaks_returns_a_copy_not_the_live_dict():
     snap = g.empty_streaks()
     snap["recent_logs"] = 999
     assert g.empty_streaks()["recent_logs"] == 1  # mutation didn't leak back
+
+
+# --- Batch 2 item H: semaphore-permit leak if Thread.start() raises ---
+
+def test_thread_start_failure_releases_the_semaphore_permit(monkeypatch):
+    # A permit acquired right before t.start() must be released even if
+    # start() itself raises (e.g. the OS is out of threads) -- otherwise
+    # that permit is gone forever, and after `max_concurrency` such
+    # failures every future collector call self-throttles to UNAVAIL
+    # regardless of load, a permanent degradation from one transient blip.
+    g = Gatherer({"recent_logs": lambda a, k, n: "## Recent logs\nok"},
+                 timeout_s=2.0, max_concurrency=1)
+
+    orig_start = threading.Thread.start
+    calls = {"n": 0}
+
+    def failing_start(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("can't start new thread")
+        return orig_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+    bundle = g.gather({"service": "sonarr"}, "k1", now=1000.0)
+    assert UNAVAIL.format("recent_logs") in bundle
+
+    monkeypatch.setattr(threading.Thread, "start", orig_start)
+    # If the permit leaked, this second call (max_concurrency=1) would find
+    # the semaphore already exhausted and self-throttle immediately even
+    # though nothing from the first call is still running.
+    bundle2 = g.gather({"service": "sonarr"}, "k1", now=1001.0)
+    assert "## Recent logs" in bundle2
+    assert UNAVAIL.format("recent_logs") not in bundle2
 
 
 def test_slow_collector_degrades_to_unavailable():
