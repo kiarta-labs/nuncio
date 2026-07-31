@@ -217,11 +217,20 @@ class Engine:
         self.mode = mode
         self._clock = clock
         self._wall_clock = wall_clock
-        # Knowledge plane (opt-in, OFF unless both are set): `router` gates which
-        # alert classes may reach it (allowlist by construction -- see
-        # nuncio.router.Router), `knowledge_llm` is the second LLMClient it's
-        # actually called against. Either being None disables the plane
-        # entirely -- see `_garnish_with_knowledge`.
+        # Knowledge plane: `router` gates which alert classes may reach it
+        # (allowlist by construction -- see nuncio.router.Router),
+        # `knowledge_llm` is the second LLMClient it's actually called
+        # against. Either being None disables the plane entirely -- see
+        # `_garnish_with_knowledge`. NOTE this is ON BY DEFAULT
+        # (NUNCIO_KNOWLEDGE_ENABLED defaults to true) and, since Phase C,
+        # the endpoint/model/key always resolve to a usable value via
+        # inheritance from the private plane when left unset -- so `router`
+        # and `knowledge_llm` are both non-None out of the box for any
+        # config.build_app-composed engine. The garnish still often ends up
+        # a no-op in that default configuration, but for a DIFFERENT reason
+        # (the full-depth redundancy skip -- see _garnish_with_knowledge's
+        # docstring and nuncio.config._knowledge_status), not because it was
+        # never turned on.
         self.router = router
         self.knowledge_llm = knowledge_llm
         # Batch B: recurrence headline suffix window (see nuncio.fingerprint)
