@@ -101,6 +101,9 @@ _SCHEMA = {
     "NUNCIO_DELIVERY_VERBOSITY": ("{}", str),
     "NUNCIO_DELIVERY_TIMEOUT_S": (30.0, float),
     "NUNCIO_DELIVERY_RETRIES": (3, int),
+    "NUNCIO_FLAP_THRESHOLD": (0, int),
+    "NUNCIO_FLAP_WINDOW_S": (10800, int),
+    "NUNCIO_FLAP_COOLDOWN_S": (3600, int),
     "NUNCIO_MODE": ("enriched", str),
     "NUNCIO_DATA_DIR": ("/data", str),
     "NUNCIO_PORT": (8095, int),
@@ -303,6 +306,19 @@ UI_EDITABLE = {
                                      group="delivery", label="Delivery retry attempts",
                                      help="Extra attempts after the first, with exponential backoff. A timeout "
                                           "is never retried regardless of this value -- see SendTimeout."),
+    "NUNCIO_FLAP_THRESHOLD": _spec("NUNCIO_FLAP_THRESHOLD", category="live", type="int", min=0, max=100,
+                                   group="delivery", label="Flap-suppression cycle threshold",
+                                   help="Number of alternating problem/ok deliveries for the same alert "
+                                        "fingerprint within the flap window before suppression kicks in. "
+                                        "0 disables flap suppression entirely (default)."),
+    "NUNCIO_FLAP_WINDOW_S": _spec("NUNCIO_FLAP_WINDOW_S", category="live", type="int", min=60, max=604800,
+                                  group="delivery", label="Flap-suppression window (seconds)",
+                                  help="Backward window the flap threshold is counted over."),
+    "NUNCIO_FLAP_COOLDOWN_S": _spec("NUNCIO_FLAP_COOLDOWN_S", category="live", type="int", min=0, max=604800,
+                                    group="delivery", label="Flap-suppression cooldown (seconds)",
+                                    help="Once flapping is detected, subsequent same-fingerprint alerts are "
+                                         "persisted with outcome=suppressed_flap (never delivered) for this "
+                                         "long."),
     "NUNCIO_EVIDENCE_MAX_BYTES": _spec("NUNCIO_EVIDENCE_MAX_BYTES", category="live", type="int", min=1000, max=500000,
                                        group="delivery", label="Evidence section cap (bytes)",
                                        help="Cap on the labeled evidence sections (logs/metrics/container state/"
@@ -1178,6 +1194,12 @@ def apply_changes(app, set_map, reset_list=None):
             engine.fingerprint_window_s = candidate.NUNCIO_FINGERPRINT_WINDOW_S
         if "NUNCIO_EVIDENCE_MAX_BYTES" in live_changed:
             engine.evidence_max_bytes = candidate.NUNCIO_EVIDENCE_MAX_BYTES
+        if "NUNCIO_FLAP_THRESHOLD" in live_changed:
+            engine.flap_threshold = candidate.NUNCIO_FLAP_THRESHOLD
+        if "NUNCIO_FLAP_WINDOW_S" in live_changed:
+            engine.flap_window_s = candidate.NUNCIO_FLAP_WINDOW_S
+        if "NUNCIO_FLAP_COOLDOWN_S" in live_changed:
+            engine.flap_cooldown_s = candidate.NUNCIO_FLAP_COOLDOWN_S
         if "NUNCIO_RETENTION_DAYS" in live_changed:
             app.retention_s = candidate.NUNCIO_RETENTION_DAYS * 86400
         if "NUNCIO_INGEST_TOKEN" in live_changed:
@@ -1663,6 +1685,9 @@ def build_app(settings=None, clock=None):
         assist=assist,
         enrich_format=settings.NUNCIO_ENRICH_FORMAT,
         depth=settings.NUNCIO_ENRICH_DEPTH, full_budget_s=settings.effective_full_budget_s,
+        flap_threshold=settings.NUNCIO_FLAP_THRESHOLD,
+        flap_window_s=settings.NUNCIO_FLAP_WINDOW_S,
+        flap_cooldown_s=settings.NUNCIO_FLAP_COOLDOWN_S,
     )
     logo_bytes, favicon_data_uri = _load_dashboard_assets()
     app = App(

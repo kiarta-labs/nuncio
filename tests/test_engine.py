@@ -10,6 +10,7 @@ import pytest
 from nuncio.engine import Engine
 from nuncio.store import Store
 from nuncio.deadline import Deadline
+from nuncio.fingerprint import fingerprint as fp_fn
 from nuncio.llm import LLMError
 from nuncio.render import RAW_FALLBACK_MARKER
 
@@ -962,6 +963,189 @@ def test_recurrence_never_suppresses_5_identical_fingerprint_alerts_all_delivere
         outcome = eng.process(f"k{i}", alert, RAW)
         assert outcome == "enriched"
     assert len(dlv.sent) == 5  # every single one delivered -- never collapsed/dropped
+
+
+# --- Batch 2 item G: flap suppression -----------------------------------
+#
+# Grouping is by nuncio.fingerprint.fingerprint(), never rendered text.
+# Semantics: once the same fingerprint has produced >= NUNCIO_FLAP_THRESHOLD
+# alternating problem/ok DELIVERIES within NUNCIO_FLAP_WINDOW_S, the
+# triggering delivery still goes out (with a flapping note appended), and
+# every subsequent same-fingerprint alert is recorded as outcome
+# 'suppressed_flap' (persisted, never delivered) for NUNCIO_FLAP_COOLDOWN_S.
+
+class FakeWall:
+    def __init__(self, t=1000.0):
+        self.t = t
+    def __call__(self):
+        return self.t
+
+
+# nuncio.fingerprint.fingerprint() hashes source|host|signature, where
+# signature is built from `output`+`state` -- NOT `severity`. Keeping
+# `state`/`output` constant across the whole alternating problem/ok
+# sequence below (varying only the free-standing `severity` field, which
+# `_flap_decision` reads directly) is what keeps every alert in a test
+# sharing ONE fingerprint despite alternating disposition. This is a
+# deliberate test simplification to exercise the threshold/cooldown
+# ALGORITHM in isolation -- see process()'s _flap_decision call site for
+# the documented real-world caveat that CheckMK's own problem vs. recovery
+# `output` text usually differs enough to land on different fingerprints.
+FLAP_ALERT_BASE = {"host": "host01", "service": "db-primary", "source": "checkmk",
+                   "state": "N/A", "output": "FATAL: recurring issue"}
+FLAP_FP = fp_fn(FLAP_ALERT_BASE)
+
+
+def _flap_alert(severity):
+    return {**FLAP_ALERT_BASE, "severity": severity}
+
+
+def _seed_delivery(store, key, fp, severity, wall, at):
+    wall.t = at
+    store.persist(key, "raw payload", source="checkmk", fingerprint=fp, severity=severity)
+    store.record_stats(key, outcome="enriched")
+
+
+def make_flap_engine(store, llm, dlv, wall, **kw):
+    return Engine(store, llm, dlv, budget_s=45.0, per_attempt_s=20.0,
+                  clock=FakeClock(), wall_clock=wall, **kw)
+
+
+def test_flap_disabled_by_default_never_suppresses(tmp_path):
+    wall = FakeWall(1000.0)
+    store = Store(str(tmp_path / "flap_off.db"), clock=wall)
+    fp = FLAP_FP
+    for i, sev in enumerate(["warning", "ok", "warning", "ok", "warning", "ok"]):
+        _seed_delivery(store, f"seed{i}", fp, sev, wall, at=1000.0 + i)
+    wall.t = 1010.0
+    dlv = FakeDelivery()
+    eng = make_flap_engine(store, FakeLLM([("ok", VALID)]), dlv, wall)  # flap_threshold defaults to 0
+    store.persist("k1", RAW, source="checkmk", fingerprint=fp, severity="warning")
+    outcome = eng.process("k1", _flap_alert("warning"), RAW)
+    assert outcome == "enriched"
+    assert len(dlv.sent) == 1
+    assert "flapping" not in dlv.sent[0].detail.lower()
+    store.close()
+
+
+def test_flap_first_problem_after_quiet_window_is_never_suppressed(tmp_path):
+    wall = FakeWall(1000.0)
+    store = Store(str(tmp_path / "flap_quiet.db"), clock=wall)
+    fp = FLAP_FP
+    dlv = FakeDelivery()
+    eng = make_flap_engine(store, FakeLLM([("ok", VALID)]), dlv, wall, flap_threshold=2)
+    store.persist("k1", RAW, source="checkmk", fingerprint=fp, severity="warning")
+    outcome = eng.process("k1", _flap_alert("warning"), RAW)
+    assert outcome == "enriched"
+    assert len(dlv.sent) == 1
+    store.close()
+
+
+def test_flap_triggers_a_note_once_threshold_reached(tmp_path):
+    wall = FakeWall(1000.0)
+    store = Store(str(tmp_path / "flap_trigger.db"), clock=wall)
+    fp = FLAP_FP
+    # 3 alternating deliveries already in the window: warning, ok, warning.
+    # threshold=4 -- the CURRENT alert (ok) is the 4th alternating delivery.
+    for i, sev in enumerate(["warning", "ok", "warning"]):
+        _seed_delivery(store, f"seed{i}", fp, sev, wall, at=1000.0 + i)
+    wall.t = 1010.0
+    dlv = FakeDelivery()
+    eng = make_flap_engine(store, FakeLLM([("ok", VALID)]), dlv, wall, flap_threshold=4, flap_window_s=10000)
+    store.persist("k1", RAW, source="checkmk", fingerprint=fp, severity="ok")
+    outcome = eng.process("k1", _flap_alert("ok"), RAW)
+    assert outcome == "enriched"
+    assert len(dlv.sent) == 1
+    assert "(flapping —" in dlv.sent[0].detail
+    assert store.get_status("k1") == "delivered_enriched"
+
+
+def test_flap_suppresses_within_cooldown_after_a_trigger(tmp_path):
+    wall = FakeWall(1000.0)
+    store = Store(str(tmp_path / "flap_cooldown.db"), clock=wall)
+    fp = FLAP_FP
+    for i, sev in enumerate(["warning", "ok", "warning"]):
+        _seed_delivery(store, f"seed{i}", fp, sev, wall, at=1000.0 + i)
+    # The trigger delivery itself (4th alternating delivery, "ok").
+    wall.t = 1010.0
+    _seed_delivery(store, "trigger", fp, "ok", wall, at=1010.0)
+    # A same-fingerprint alert arriving inside the cooldown window.
+    wall.t = 1010.0 + 100
+    dlv = FakeDelivery()
+    eng = make_flap_engine(store, FakeLLM([("ok", VALID)]), dlv, wall,
+                            flap_threshold=4, flap_window_s=10000, flap_cooldown_s=3600)
+    store.persist("k1", RAW, source="checkmk", fingerprint=fp, severity="warning")
+    outcome = eng.process("k1", _flap_alert("warning"), RAW)
+    assert outcome == "suppressed_flap"
+    assert dlv.sent == []  # never actually sent
+    assert store.get_status("k1") == "delivered_suppressed_flap"
+
+
+def test_flap_resumes_delivery_after_cooldown_expires(tmp_path):
+    wall = FakeWall(1000.0)
+    store = Store(str(tmp_path / "flap_resume.db"), clock=wall)
+    fp = FLAP_FP
+    for i, sev in enumerate(["warning", "ok", "warning"]):
+        _seed_delivery(store, f"seed{i}", fp, sev, wall, at=1000.0 + i)
+    wall.t = 1010.0
+    _seed_delivery(store, "trigger", fp, "ok", wall, at=1010.0)
+    # Past the cooldown window (3600s) -- normal delivery resumes.
+    wall.t = 1010.0 + 4000
+    dlv = FakeDelivery()
+    eng = make_flap_engine(store, FakeLLM([("ok", VALID)]), dlv, wall,
+                            flap_threshold=4, flap_window_s=10000, flap_cooldown_s=3600)
+    store.persist("k1", RAW, source="checkmk", fingerprint=fp, severity="warning")
+    outcome = eng.process("k1", _flap_alert("warning"), RAW)
+    assert outcome == "enriched"
+    assert len(dlv.sent) == 1
+
+
+def test_flap_grouped_by_fingerprint_not_severity_alone(tmp_path):
+    # A DIFFERENT fingerprint alternating in severity must never feed into
+    # (or be suppressed by) another fingerprint's flap state.
+    wall = FakeWall(1000.0)
+    store = Store(str(tmp_path / "flap_fp_isolation.db"), clock=wall)
+    fp_a = FLAP_FP
+    other_alert = {**FLAP_ALERT_BASE, "output": "unrelated issue", "severity": "ok"}
+    fp_b = fp_fn(other_alert)
+    assert fp_a != fp_b
+    for i, sev in enumerate(["warning", "ok", "warning"]):
+        _seed_delivery(store, f"a{i}", fp_a, sev, wall, at=1000.0 + i)
+    wall.t = 1010.0
+    dlv = FakeDelivery()
+    eng = make_flap_engine(store, FakeLLM([("ok", VALID)]), dlv, wall, flap_threshold=4, flap_window_s=10000)
+    store.persist("k1", RAW, source="checkmk", fingerprint=fp_b, severity="ok")
+    outcome = eng.process("k1", other_alert, RAW)
+    assert outcome == "enriched"
+    assert "flapping" not in dlv.sent[0].detail.lower()  # fp_b has no history of its own
+
+
+def test_flap_decision_fails_open_on_store_exception(tmp_path, monkeypatch):
+    wall = FakeWall(1000.0)
+    store = Store(str(tmp_path / "flap_boom.db"), clock=wall)
+    fp = FLAP_FP
+
+    def boom(*a, **k):
+        raise RuntimeError("store broke")
+    monkeypatch.setattr(store, "fingerprint_deliveries", boom)
+
+    dlv = FakeDelivery()
+    eng = make_flap_engine(store, FakeLLM([("ok", VALID)]), dlv, wall, flap_threshold=2)
+    store.persist("k1", RAW, source="checkmk", fingerprint=fp, severity="warning")
+    outcome = eng.process("k1", _flap_alert("warning"), RAW)
+    assert outcome == "enriched"  # fail OPEN -- delivered normally despite the store hiccup
+    assert len(dlv.sent) == 1
+
+
+def test_flap_decision_returns_none_when_alert_has_no_fingerprint(tmp_path):
+    wall = FakeWall(1000.0)
+    store = Store(str(tmp_path / "flap_no_fp.db"), clock=wall)
+    dlv = FakeDelivery()
+    eng = make_flap_engine(store, FakeLLM([("ok", VALID)]), dlv, wall, flap_threshold=1)
+    store.persist("k1", RAW)  # no fingerprint at all
+    outcome = eng.process("k1", {}, RAW)  # empty alert -> fingerprint() returns None
+    assert outcome == "enriched"
+    assert len(dlv.sent) == 1
 
 
 # =====================================================================

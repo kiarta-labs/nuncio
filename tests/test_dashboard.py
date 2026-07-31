@@ -127,6 +127,19 @@ def test_subject_falls_back_to_payload_when_columns_and_key_are_empty():
     assert dashboard._subject(row) == "HighCPU"
 
 
+# --- Batch 2 item G: fingerprint fallback before payload-first-line ---
+
+def test_subject_falls_back_to_fingerprint_before_payload_first_line():
+    row = {"host": None, "service": None, "fingerprint": "fp-abc123",
+           "payload": "some unstructured problem text that fingerprint should win over"}
+    assert dashboard._subject(row) == "fp-abc123"
+
+
+def test_subject_still_falls_back_to_payload_when_no_fingerprint():
+    row = {"host": None, "service": None, "fingerprint": None, "payload": "[FIRING] - / HighCPU — msg"}
+    assert dashboard._subject(row) == "HighCPU"
+
+
 # --- _derive_host_service() ---
 
 def test_derive_host_service_columns_win_when_host_present():
@@ -452,6 +465,28 @@ def test_noisiest_subjects_derives_subject_from_payload_when_columns_missing():
              "payload": "[RECOVERY] svr / Interface 5 — up"}]
     out = dashboard._noisiest_subjects_24h(rows)
     assert out[0]["subject"] == "svr/Interface 5"
+
+
+def test_noisiest_subjects_groups_by_fingerprint_when_payload_first_lines_differ():
+    # Problem and recovery notifications for the SAME underlying alert often
+    # render completely different payload first lines (e.g. "CRITICAL -
+    # service down" vs "OK - service recovered") -- grouping by that text
+    # split them into different "subjects" and flap-cycle detection (which
+    # needs both P and R states in ONE group) never fired. Grouping by the
+    # shared fingerprint instead (when host/service columns are missing)
+    # keeps them together.
+    rows = [
+        {"host": None, "service": None, "created_at": 1, "severity": "warning",
+         "fingerprint": "fp-shared", "payload": "problem text one"},
+        {"host": None, "service": None, "created_at": 2, "severity": "ok",
+         "fingerprint": "fp-shared", "payload": "recovery text totally different"},
+        {"host": None, "service": None, "created_at": 3, "severity": "warning",
+         "fingerprint": "fp-shared", "payload": "problem text one again"},
+    ]
+    out = dashboard._noisiest_subjects_24h(rows)
+    assert len(out) == 1  # one grouped subject, not three
+    assert out[0]["subject"] == "fp-shared"
+    assert out[0]["flap_cycles"] == 1
 
 
 def test_noisiest_subjects_sorted_desc_and_capped():
