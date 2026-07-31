@@ -123,6 +123,7 @@ _SCHEMA = {
     "NUNCIO_LOGS_USER": ("", str),
     "NUNCIO_LOGS_TOKEN": ("", str),
     "NUNCIO_LOGS_INDEX": ("", str),
+    "NUNCIO_LOGS_FIELD": ("message", str),
     "NUNCIO_CONTAINERS": ("null", str),
     "NUNCIO_DOCKER_HOST": ("unix:///var/run/docker.sock", str),
     "NUNCIO_METRICS": ("null", str),
@@ -350,6 +351,8 @@ UI_EDITABLE = {
                                label="Log store token"),
     "NUNCIO_LOGS_INDEX": _spec("NUNCIO_LOGS_INDEX", category="live", type="str", group="sources",
                                label="Log store index/stream"),
+    "NUNCIO_LOGS_FIELD": _spec("NUNCIO_LOGS_FIELD", category="live", type="str", group="sources",
+                               label="Log store text field (openobserve only)"),
     "NUNCIO_CONTAINERS": _spec("NUNCIO_CONTAINERS", category="live", type="enum", allowed=("null", "docker"),
                                group="sources", label="Container backend"),
     "NUNCIO_DOCKER_HOST": _spec("NUNCIO_DOCKER_HOST", category="live", type="str", group="sources",
@@ -946,6 +949,7 @@ _GATHERER_KEYS = frozenset({
     "NUNCIO_GATHER_TIMEOUT_S", "NUNCIO_BUNDLE_MAX_BYTES", "NUNCIO_CORRELATION_WINDOW_S",
     "NUNCIO_FINGERPRINT_WINDOW_S", "NUNCIO_HOST_DOMAINS",
     "NUNCIO_LOGS", "NUNCIO_LOGS_URL", "NUNCIO_LOGS_USER", "NUNCIO_LOGS_TOKEN", "NUNCIO_LOGS_INDEX",
+    "NUNCIO_LOGS_FIELD",
     "NUNCIO_CONTAINERS", "NUNCIO_DOCKER_HOST",
     "NUNCIO_METRICS", "NUNCIO_METRICS_URL", "NUNCIO_METRICS_USER", "NUNCIO_METRICS_TOKEN",
 })
@@ -1296,7 +1300,7 @@ def build_log_client(settings):
         return OpenObserveClient(
             settings.NUNCIO_LOGS_URL, user=settings.NUNCIO_LOGS_USER,
             token=settings.NUNCIO_LOGS_TOKEN, stream=settings.NUNCIO_LOGS_INDEX,
-            timeout=timeout,
+            field=settings.NUNCIO_LOGS_FIELD, timeout=timeout,
         )
     if backend == "loki":
         return LokiClient(

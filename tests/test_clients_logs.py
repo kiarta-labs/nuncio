@@ -33,6 +33,55 @@ def test_openobserve_sends_basic_auth_headers():
     assert captured["headers"]["Authorization"].startswith("Basic ")
 
 
+def test_openobserve_query_matches_against_message_field_by_default():
+    # The `docker` stream (this repo's own default deployment target) has no
+    # `log` column -- querying against it 500s and the exception is swallowed,
+    # so every alert ships with zero log context. The query must match the
+    # actual text field, which is `message` by default.
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", transport=fake_transport)
+    client.query("web-1", "sonarr")
+    sql = captured["sql"]
+    assert "str_match_ignore_case(message, " in sql
+    assert "str_match_ignore_case(log, " not in sql
+
+
+def test_openobserve_query_field_is_configurable():
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", field="log", transport=fake_transport)
+    client.query("web-1", "sonarr")
+    sql = captured["sql"]
+    assert "str_match_ignore_case(log, " in sql
+    assert "str_match_ignore_case(message, " not in sql
+
+
+def test_openobserve_query_field_falls_back_to_message_when_invalid():
+    # The field name is interpolated straight into the SQL (it names a
+    # column, so it can't be a bind parameter) -- an attacker- or
+    # misconfig-controlled value must never reach the query unvalidated.
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default",
+                                field="message) OR 1=1 -- ", transport=fake_transport)
+    client.query("web-1")
+    assert "str_match_ignore_case(message, " in captured["sql"]
+    assert "1=1" not in captured["sql"]
+
+
 def test_openobserve_query_includes_window_as_microsecond_bounds():
     captured = {}
 
