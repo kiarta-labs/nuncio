@@ -26,7 +26,7 @@ class Ntfy(DeliveryAdapter):
         self.url = f"{base}/{topic}" if base and topic else None
         self.token = cfg.get("token") or None
         self._transport = transport or _urllib_transport
-        self.timeout = timeout
+        self.timeout = cfg.get("timeout", timeout)
 
     def send(self, title, body, severity="unknown", **kw):
         if not self.url:

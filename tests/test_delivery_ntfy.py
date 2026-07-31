@@ -78,6 +78,13 @@ def test_ascii_title_stays_a_plain_unencoded_string():
     assert "=?" not in header_value  # not RFC 2047-encoded
 
 
+def test_timeout_config_reaches_the_transport_call():
+    t = Transport(200)
+    n = Ntfy({"url": "https://ntfy.sh", "topic": "x", "timeout": 45}, transport=t)
+    n.send("t", "b")
+    assert t.calls[0][3] == 45
+
+
 def test_send_rejects_non_http_scheme(monkeypatch):
     def fail_urlopen(*a, **kw):
         pytest.fail("urlopen should not be reached for a non-http scheme")

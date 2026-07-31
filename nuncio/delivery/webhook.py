@@ -51,7 +51,7 @@ class Webhook(DeliveryAdapter):
         self.headers.setdefault("Content-Type", "application/json")
         self.template = cfg.get("template") or _DEFAULT_TEMPLATE
         self._transport = transport or _urllib_transport
-        self.timeout = timeout
+        self.timeout = cfg.get("timeout", timeout)
 
     def send(self, title, body, severity="unknown", **kw):
         if not self.url:

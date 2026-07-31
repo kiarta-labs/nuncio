@@ -492,6 +492,28 @@ def test_build_delivery_dispatch_matches_engine_calling_convention():
     assert d.send(_envelope("just a message")) is True
 
 
+def test_build_delivery_wires_timeout_into_apprise_adapter():
+    s = config.load_settings(base_env(NUNCIO_DELIVERY="apprise", NUNCIO_APPRISE_URL="http://apprise:8000/notify/x",
+                                       NUNCIO_DELIVERY_TIMEOUT_S="45"))
+    d = config.build_delivery(s)
+    name, retrying, verbosity = d.channels[0]
+    assert retrying.adapter.timeout == 45.0
+
+
+def test_build_delivery_wires_retries_into_retrying():
+    s = config.load_settings(base_env(NUNCIO_DELIVERY="apprise", NUNCIO_APPRISE_URL="http://apprise:8000/notify/x",
+                                       NUNCIO_DELIVERY_RETRIES="5"))
+    d = config.build_delivery(s)
+    name, retrying, verbosity = d.channels[0]
+    assert retrying.retries == 5
+
+
+def test_delivery_timeout_and_retries_default():
+    s = config.load_settings(base_env())
+    assert s.NUNCIO_DELIVERY_TIMEOUT_S == 30.0
+    assert s.NUNCIO_DELIVERY_RETRIES == 3
+
+
 # --- LOW: Dispatch's contract is "return bool, never raise" ---
 
 def test_dispatch_returns_false_not_raise_on_adapter_exception():

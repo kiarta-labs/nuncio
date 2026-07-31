@@ -35,6 +35,13 @@ def test_failure_status_returns_false():
     assert s.send("t", "b") is False
 
 
+def test_timeout_config_reaches_the_transport_call():
+    t = Transport(200)
+    s = Slack({"webhook_url": "https://hooks.slack.com/x", "timeout": 45}, transport=t)
+    s.send("t", "b")
+    assert t.calls[0][2] == 45
+
+
 def test_send_rejects_non_http_scheme(monkeypatch):
     def fail_urlopen(*a, **kw):
         pytest.fail("urlopen should not be reached for a non-http scheme")

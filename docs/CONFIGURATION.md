@@ -103,6 +103,8 @@ A second, opposite-direction quirk: because the secrets-first pass runs before t
 | `NUNCIO_EMAIL_TO` | `""` | Comma-separated `To:` address(es) -- a delivery target, treated as a credential. |
 | `NUNCIO_EMAIL_TLS` | `starttls` | One of `starttls`, `ssl`, `none`. |
 | `NUNCIO_DELIVERY_VERBOSITY` | `{}` | JSON object of adapter name -> `"brief"` \| `"full"`, overlaying the built-in default (`ntfy`/`telegram`/`apprise` = brief; `email`/`slack`/`webhook`/`stdout` = full). An unknown adapter name logs a startup warning; an invalid value is a fatal `ConfigError`. |
+| `NUNCIO_DELIVERY_TIMEOUT_S` | `30` | Socket timeout for the HTTP-based delivery adapters (`apprise`, `ntfy`, `telegram`, `slack`, `webhook`); not used by `email` (its own SMTP timeout) or `stdout` (no transport). |
+| `NUNCIO_DELIVERY_RETRIES` | `3` | Extra send attempts after the first, with exponential backoff, wired into the shared `Retrying` wrapper. A timeout is never retried regardless of this value -- the send may have already reached the channel, and the POST is not idempotent (see `SendTimeout` in `nuncio/delivery/__init__.py`). |
 
 Every delivery attempt is retried by the built-in `Retrying` wrapper; a non-2xx or connection failure on one adapter doesn't stop the others in a multi-adapter `NUNCIO_DELIVERY` list. Each channel renders the alert at its own verbosity: `brief` channels get a terse title + a short (≤120 char) body, `full` channels get the complete detail (enrichment + embedded raw alert).
 

@@ -1,12 +1,14 @@
 """Generic bounded-retry wrapper. Tests `Retrying` wrapping a fake
 DeliveryAdapter, since retry behavior lives in this shared wrapper rather
 than in any single adapter."""
+from nuncio.delivery import SendTimeout
 from nuncio.delivery.retrying import Retrying
 
 
 class FakeAdapter:
     """Returns queued outcomes in order; records calls. An outcome of
-    'raise' simulates a channel/connection exception."""
+    'raise' simulates a channel/connection exception; 'timeout' simulates
+    a SendTimeout (the POST may have already reached the far end)."""
     name = "fake"
 
     def __init__(self, outcomes):
@@ -18,6 +20,8 @@ class FakeAdapter:
         o = self.outcomes[len(self.calls) - 1]
         if o == "raise":
             raise ConnectionError("channel down")
+        if o == "timeout":
+            raise SendTimeout("timed out")
         return o
 
 
@@ -59,6 +63,23 @@ def test_send_passes_title_body_severity_through():
     r.send("the title", "the body", "critical")
     title, body, severity = a.calls[0]
     assert title == "the title" and body == "the body" and severity == "critical"
+
+
+def test_send_timeout_is_not_retried():
+    # A timeout means the POST may have already succeeded on the far end
+    # (non-idempotent) -- retrying it risks a duplicate push, so Retrying
+    # must give up immediately rather than treat it like a transient
+    # connection failure.
+    r, a, slept = make(["timeout"])
+    assert r.send("title", "hello") is False
+    assert len(a.calls) == 1
+    assert slept == []
+
+
+def test_send_timeout_after_other_failures_still_stops_immediately():
+    r, a, slept = make([False, "timeout", True])
+    assert r.send("title", "hello") is False
+    assert len(a.calls) == 2  # never reaches the 3rd (would-succeed) attempt
 
 
 def test_name_reflects_wrapped_adapter():
