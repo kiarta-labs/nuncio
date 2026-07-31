@@ -24,6 +24,9 @@ from nuncio.clients.http import basic_or_bearer_auth, request_json
 log = logging.getLogger("nuncio.clients.logs")
 
 
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def _escape_sql(value):
     return str(value).replace("'", "''")
 
@@ -85,13 +88,23 @@ class OpenObserveClient:
     `base_url` is the API base up to and including the org segment (e.g.
     `http://openobserve.example:5080/api/default`) -- this client appends
     `/_search` and names the stream in the SQL query. `stream` is the
-    OpenObserve stream to query (configured via `NUNCIO_LOGS_INDEX`)."""
+    OpenObserve stream to query (configured via `NUNCIO_LOGS_INDEX`).
+    `field` is the stream's text/message column to match against (configured
+    via `NUNCIO_LOGS_FIELD`, default `message`) -- OpenObserve schemas vary
+    by stream (Vector's `docker` stream uses `message`, some setups use
+    `log`), so this is deployment-specific, not a fixed name."""
 
-    def __init__(self, base_url, user="", token="", stream="", timeout=4.0,
+    def __init__(self, base_url, user="", token="", stream="", field="message", timeout=4.0,
                  max_lines=200, max_bytes=100_000, transport=None):
         self._base_url = (base_url or "").rstrip("/")
         self._headers = basic_or_bearer_auth(user, token)
         self._stream = stream or "default"
+        # The field name is interpolated directly into the SQL below (it
+        # names a column, so it can't be a bind parameter) -- an unvalidated
+        # value would be a SQL-injection vector via config, not just a
+        # malformed query. Anything that isn't a plain identifier falls back
+        # to the safe default rather than being sent to OpenObserve.
+        self._field = field if field and _FIELD_NAME_RE.match(field) else "message"
         self._timeout = timeout
         self._max_lines = max_lines
         self._max_bytes = max_bytes
@@ -103,7 +116,7 @@ class OpenObserveClient:
         try:
             return self._query(host, unit, window_s)
         except Exception as e:
-            log.debug("openobserve log query failed: %r", e)
+            log.warning("openobserve log query failed: %r", e)
             return []
 
     def _query(self, host, unit, window_s):
@@ -111,9 +124,9 @@ class OpenObserveClient:
         start_us = now_us - int(max(0, window_s) * 1_000_000)
         clauses = []
         if host:
-            clauses.append(f"str_match_ignore_case(log, '{_escape_sql(host)}')")
+            clauses.append(f"str_match_ignore_case({self._field}, '{_escape_sql(host)}')")
         if unit:
-            clauses.append(f"str_match_ignore_case(log, '{_escape_sql(unit)}')")
+            clauses.append(f"str_match_ignore_case({self._field}, '{_escape_sql(unit)}')")
         where = f" WHERE {' OR '.join(clauses)}" if clauses else ""
         sql = f'SELECT * FROM "{self._stream}"{where} ORDER BY _timestamp DESC'
         payload = {
@@ -160,7 +173,7 @@ class LokiClient:
         try:
             return self._query(host, unit, window_s)
         except Exception as e:
-            log.debug("loki log query failed: %r", e)
+            log.warning("loki log query failed: %r", e)
             return []
 
     def _query(self, host, unit, window_s):

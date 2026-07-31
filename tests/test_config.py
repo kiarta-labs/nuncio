@@ -734,6 +734,19 @@ def test_build_log_client_selects_openobserve():
     assert config.collector_impl_names(client, client, client)["logs"] == "openobserve"
 
 
+def test_build_log_client_wires_logs_field_through_to_openobserve():
+    s = config.load_settings(base_env(NUNCIO_LOGS="openobserve", NUNCIO_LOGS_URL="http://o2:5080/api/default",
+                                       NUNCIO_LOGS_FIELD="log"))
+    client = config.build_log_client(s)
+    assert client._field == "log"
+
+
+def test_build_log_client_defaults_logs_field_to_message():
+    s = config.load_settings(base_env(NUNCIO_LOGS="openobserve", NUNCIO_LOGS_URL="http://o2:5080/api/default"))
+    client = config.build_log_client(s)
+    assert client._field == "message"
+
+
 def test_build_log_client_selects_loki():
     from nuncio.clients.logs import LokiClient
     s = config.load_settings(base_env(NUNCIO_LOGS="loki", NUNCIO_LOGS_URL="http://loki:3100"))
