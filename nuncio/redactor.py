@@ -58,7 +58,20 @@ _RULES = [
      re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://)[^\s:/@]+:[^\s:/@]+@"),
      r"\1«REDACTED:basic_auth»@"),
     ("auth_header",
-     re.compile(r"(?im)^(Authorization|Proxy-Authorization|Cookie|Set-Cookie|X-Api-Key|X-Auth-Token|Api-Key):[ \t]*[^\r\n]+"),
+     # Anchor: a true line start (the original plaintext-header case, e.g.
+     # "Authorization: Bearer x\r\n") OR immediately after "{"/whitespace/a
+     # comma -- covers the SAME header name rendered as a JSON key on a
+     # json.dumps()'d single line (e.g. engine.py's rendered dict fields),
+     # where there is no line start to anchor on at all. The optional
+     # quotes around the key handle the JSON-key spelling; the value
+     # alternation prefers a whole quoted JSON string (stopping at its own
+     # closing quote) so it never swallows sibling fields on the same
+     # line, falling back to the original "rest of the line" behavior for
+     # an unquoted plaintext header value.
+     re.compile(
+         r'(?im)(?:^|(?<=[{\s,]))"?(Authorization|Proxy-Authorization|Cookie|Set-Cookie|X-Api-Key|X-Auth-Token|Api-Key)"?'
+         r':[ \t]*(?:"[^"\r\n]*"|[^\r\n,}]+)'
+     ),
      r"\1: «REDACTED:auth_header»"),
     # Recognizable token formats (a broadened catalog of known secret shapes).
     ("jwt",
@@ -78,11 +91,19 @@ _RULES = [
          r"|A(?:KIA|SIA|ROA)[0-9A-Z]{16}"      # AWS access/temp/role key ids
          r")\b"),
      "«REDACTED:api_key»"),
+    # A bare hex digest (md5/sha/lowercase-hex secret token, >=32 chars) with
+    # no key name and no known prefix. This shape has only 2 distinct
+    # character classes (hex letters + digits, or all-uppercase-hex +
+    # digits), so it never trips the >=3-class entropy backstop below --
+    # a genuine secret in this shape passed through completely unredacted
+    # without a dedicated rule. 32 chars floors at an MD5 digest length;
+    # shorter hex runs (e.g. a short container-id fragment) are left alone.
+    ("hex_secret", re.compile(r"\b[0-9a-fA-F]{32,}\b"), "«REDACTED:hex_secret»"),
     # Generic key:value / key=value with a known-secret KEY NAME (JSON/YAML/env/TOML).
     # Value may be a full quoted string (spaces ok) OR an unquoted token; never a
     # placeholder. Key match allows a leading `_` (compound names like smb_pass).
     ("kv_secret",
-     re.compile(r'(?i)"?(?:\b|(?<=_))(password|passwd|pwd|pass|token|apikey|api[_-]?key|secret|access[_-]?key|client[_-]?secret|cred(?:ential)?|auth[_-]?pass)"?\s*[:=]\s*(?:"[^"«]*"|[^\s"«,}]+)'),
+     re.compile(r'(?i)"?(?:\b|(?<=_))(password|passwd|pwd|pass|token|apikey|api[_-]?key|secret|access[_-]?key|client[_-]?secret|cred(?:ential)?|auth[_-]?pass|authorization|bearer|cookie|session)"?\s*[:=]\s*(?:"[^"«]*"|[^\s"«,}]+)'),
      r"\1=«REDACTED:kv_secret»"),
     # Env-var line whose NAME hits the denylist — keep the name (diagnostic), strip
     # the value. Denylist includes PASS/PWD/CRED/AUTH so compound names like

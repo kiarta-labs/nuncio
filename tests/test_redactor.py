@@ -4,6 +4,8 @@ Each test asserts (a) the secret value is GONE from the output and (b) a typed
 finding is recorded so the LLM still sees a credential *was* present and of what
 kind (often diagnostic — e.g. the Vector 401 was an env-var secret problem).
 """
+import json
+
 from nuncio.redactor import (
     compile_allow_keywords,
     count_redactions,
@@ -373,7 +375,10 @@ def test_basic_auth_still_redacted_after_bounding():
 def test_redact_caps_input_length():
     from nuncio.redactor import _INPUT_CAP
 
-    text = "a" * (_INPUT_CAP + 10_000)
+    # "z" (not a hex digit) -- a long run of hex-only chars (e.g. "a") would
+    # itself now trip the hex_secret rule, which is incidental to what this
+    # test is checking (length capping).
+    text = "z" * (_INPUT_CAP + 10_000)
     out, findings = redact(text)
     assert len(out) < _INPUT_CAP + 100
     assert any(f["type"] == "input_truncated" for f in findings)
@@ -382,7 +387,7 @@ def test_redact_caps_input_length():
 def test_input_truncated_not_counted_as_redaction():
     from nuncio.redactor import _INPUT_CAP
 
-    text = "a" * (_INPUT_CAP + 10_000)
+    text = "z" * (_INPUT_CAP + 10_000)
     _, findings = redact(text)
     assert count_redactions(findings) == 0
 
@@ -395,4 +400,98 @@ def test_secret_before_cap_still_redacted_after_truncation():
     text = f"{prefix} password={secret} " + ("a" * _INPUT_CAP)
     out, findings = redact(text)
     assert secret not in out
+
+
+# --- Batch 2 item D: redactor gaps -------------------------------------
+
+def test_redacts_bare_md5_style_hex_secret():
+    # A bare lowercase-hex secret (e.g. an md5/sha digest used as an API
+    # key/session token) has only 2 distinct character classes (lower +
+    # digit) -- the entropy backstop requires >=3 classes, so this shape
+    # passed through completely unredacted before the dedicated hex rule.
+    secret = "5f4dcc3b5aa765d61d8327deb882cf99aabbccddeeff00112233445566778899"
+    out, findings = redact(f"session key {secret} accepted")
+    assert secret not in out
+    assert any(f["type"] == "hex_secret" for f in findings)
+
+
+def test_redacts_bare_uppercase_hex_secret():
+    secret = "5F4DCC3B5AA765D61D8327DEB882CF99AABBCCDDEEFF00112233445566778899"
+    out, findings = redact(f"session key {secret} accepted")
+    assert secret not in out
+    assert any(f["type"] == "hex_secret" for f in findings)
+
+
+def test_short_hex_below_threshold_is_not_touched():
+    # Below the 32-char floor -- e.g. a short docker container id fragment
+    # -- must survive; this rule targets digest-length bare secrets, not
+    # every hex-looking token.
+    text = "container 619419459632 restarted"
+    out, findings = redact(text)
+    assert out == text
+
+
+def test_json_dumped_single_line_authorization_header_is_redacted():
+    # engine.py renders dict-shaped delivery fields (e.g. webhook headers)
+    # via json.dumps onto ONE line -- the auth_header rule's `^`-only line
+    # anchor never matches a quoted JSON key mid-line, so this bypassed
+    # redaction entirely before the anchor was broadened.
+    payload = json.dumps({
+        "headers": {"Authorization": "Bearer topsecrettoken123"},
+        "other_field": "kept-value",
+    })
+    out, findings = redact(payload)
+    assert "topsecrettoken123" not in out
+    assert any(f["type"] == "auth_header" for f in findings)
+    assert "kept-value" in out  # nothing beyond the header value was swallowed
+
+
+def test_json_dumped_cookie_header_after_comma_is_redacted():
+    payload = '{"a": "1", "Cookie": "session=topsecretcookievalue"}'
+    out, findings = redact(payload)
+    assert "topsecretcookievalue" not in out
+    assert any(f["type"] == "auth_header" for f in findings)
+
+
+def test_auth_header_still_redacted_at_real_line_start():
+    # Regression guard: the original line-anchored case must keep working.
+    out, findings = redact("GET /api\r\nAuthorization: Bearer topsecrettoken123\r\nHost: x")
+    assert "topsecrettoken123" not in out
+    assert any(f["type"] == "auth_header" for f in findings)
+
+
+def test_kv_secret_catches_bearer_key_name():
+    out, findings = redact('bearer=topsecrettoken123 accepted')
+    assert "topsecrettoken123" not in out
     assert any(f["type"] == "kv_secret" for f in findings)
+
+
+def test_kv_secret_catches_authorization_key_name():
+    out, findings = redact('authorization=topsecrettoken123 accepted')
+    assert "topsecrettoken123" not in out
+    assert any(f["type"] == "kv_secret" for f in findings)
+
+
+def test_kv_secret_catches_session_key_name():
+    out, findings = redact('session=topsecretsessionvalue123 accepted')
+    assert "topsecretsessionvalue123" not in out
+    assert any(f["type"] == "kv_secret" for f in findings)
+
+
+def test_kv_secret_catches_cookie_key_name():
+    out, findings = redact('cookie=topsecretcookievalue123 accepted')
+    assert "topsecretcookievalue123" not in out
+    assert any(f["type"] == "kv_secret" for f in findings)
+
+
+def test_unifi_device_name_still_survives_after_batch2_redactor_changes():
+    # Regression guard for the entropy-allowlist: none of the new
+    # hex_secret/auth_header/kv_secret changes may reintroduce the
+    # USW-Pro-Max-48-PoE-Gen2 false-positive.
+    set_allow_keywords(["USW", "PoE"])
+    try:
+        text = "switch USW-Pro-Max-48-PoE-Gen2 flapped"
+        out, findings = redact(text)
+        assert "USW-Pro-Max-48-PoE-Gen2" in out
+    finally:
+        set_allow_keywords([])
