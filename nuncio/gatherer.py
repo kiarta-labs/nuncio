@@ -6,6 +6,7 @@ DAEMON threads bounded by a shared semaphore (so a hung read-only client can't
 leak threads unboundedly or hang `docker stop`); any that are slow/error degrade
 to a «context unavailable» marker. Output is the assembled, capped bundle.
 """
+import logging
 import threading
 import time
 
@@ -25,6 +26,8 @@ from nuncio.model import (  # noqa: F401 — re-exported for back-compat
 # Per-category collector selection. 'correlated' and 'recurrence' are always
 # included (recurrence needs only the store's own fingerprint index, so even
 # a bare install gets it for free -- same reasoning as 'correlated').
+log = logging.getLogger("nuncio.gatherer")
+
 _CATEGORY_COLLECTORS = {
     "container": ["recent_logs", "container_state", "correlated", "recurrence"],
     "storage": ["recent_logs", "metrics", "correlated", "recurrence"],
@@ -172,7 +175,20 @@ class Gatherer:
                     self._sem.release()
 
             t = threading.Thread(target=run, daemon=True)  # daemon: no atexit-join hang
-            t.start()
+            try:
+                t.start()
+            except Exception:
+                # The permit was acquired above but run() -- whose `finally`
+                # releases it -- never got to execute at all. Without this,
+                # a start() failure (e.g. the OS is temporarily out of
+                # threads) leaks one permit forever; after max_concurrency
+                # such failures the semaphore is permanently exhausted and
+                # every future collector call self-throttles to UNAVAIL
+                # regardless of actual load.
+                self._sem.release()
+                results[n] = UNAVAIL.format(n)
+                log.warning("failed to start collector thread for %r", n, exc_info=True)
+                continue
             threads[n] = t
 
         end = time.monotonic() + max(0.0, timeout)
