@@ -28,7 +28,13 @@ _FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _escape_sql(value):
-    return str(value).replace("'", "''")
+    # Backslash BEFORE quote -- same ordering rationale as _escape_logql
+    # below: the escaper's own backslashes must be doubled first, or a
+    # value containing a backslash immediately before a quote could
+    # re-combine after quote-escaping in a way that breaks back out of the
+    # string literal.
+    s = str(value).replace("\\", "\\\\")
+    return s.replace("'", "''")
 
 
 def _escape_logql_re(value):
@@ -92,9 +98,19 @@ class OpenObserveClient:
     `field` is the stream's text/message column to match against (configured
     via `NUNCIO_LOGS_FIELD`, default `message`) -- OpenObserve schemas vary
     by stream (Vector's `docker` stream uses `message`, some setups use
-    `log`), so this is deployment-specific, not a fixed name."""
+    `log`), so this is deployment-specific, not a fixed name.
 
-    def __init__(self, base_url, user="", token="", stream="", field="message", timeout=4.0,
+    `unit_field` (configured via `NUNCIO_LOGS_UNIT_FIELD`, default
+    `container_name` -- verified against the live Vector-shipped `docker`
+    stream schema) is a structured label column to filter `unit` against
+    directly, in addition to the message-text substring match: far more
+    precise than only matching the unit name as a substring of the message
+    text, which also matches any line that merely MENTIONS the service
+    name. Pass `""` to disable it and fall back to the original
+    message-only matching for both host and unit."""
+
+    def __init__(self, base_url, user="", token="", stream="", field="message",
+                 unit_field="container_name", timeout=4.0,
                  max_lines=200, max_bytes=100_000, transport=None):
         self._base_url = (base_url or "").rstrip("/")
         self._headers = basic_or_bearer_auth(user, token)
@@ -105,6 +121,16 @@ class OpenObserveClient:
         # malformed query. Anything that isn't a plain identifier falls back
         # to the safe default rather than being sent to OpenObserve.
         self._field = field if field and _FIELD_NAME_RE.match(field) else "message"
+        # unit_field has no equally-safe default to fall back to (unlike
+        # `field`, whose "message" default is virtually always a real
+        # column) -- an explicit "" disables it, and an invalid non-empty
+        # value ALSO disables it (rather than guessing a fallback column
+        # name that may not exist in this stream) instead of being
+        # interpolated unvalidated.
+        if unit_field and _FIELD_NAME_RE.match(unit_field):
+            self._unit_field = unit_field
+        else:
+            self._unit_field = ""
         self._timeout = timeout
         self._max_lines = max_lines
         self._max_bytes = max_bytes
@@ -122,13 +148,23 @@ class OpenObserveClient:
     def _query(self, host, unit, window_s):
         now_us = int(time.time() * 1_000_000)
         start_us = now_us - int(max(0, window_s) * 1_000_000)
+        use_unit_field = bool(self._unit_field and unit)
         clauses = []
         if host:
             clauses.append(f"str_match_ignore_case({self._field}, '{_escape_sql(host)}')")
         if unit:
             clauses.append(f"str_match_ignore_case({self._field}, '{_escape_sql(unit)}')")
+            if use_unit_field:
+                # ADDITIONAL (OR'd) clause against the structured label
+                # column -- never replaces the message-text match above, so
+                # this can only broaden recall, never narrow it below the
+                # pre-existing behavior.
+                clauses.append(f"str_match_ignore_case({self._unit_field}, '{_escape_sql(unit)}')")
         where = f" WHERE {' OR '.join(clauses)}" if clauses else ""
-        sql = f'SELECT * FROM "{self._stream}"{where} ORDER BY _timestamp DESC'
+        select_cols = f"_timestamp, {self._field}"
+        if use_unit_field:
+            select_cols += f", {self._unit_field}"
+        sql = f'SELECT {select_cols} FROM "{self._stream}"{where} ORDER BY _timestamp DESC'
         payload = {
             "query": {
                 "sql": sql,
