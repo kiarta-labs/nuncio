@@ -4,6 +4,7 @@ Tested with 0 workers so the queue is inspectable and there are no thread races.
 """
 import threading
 import time
+import types
 
 import pytest
 from nuncio.deadline import Deadline
@@ -1182,6 +1183,31 @@ def test_worker_skipped_duplicate_outcome_increments_duplicates_avoided_not_deli
     assert app.metrics.duplicates_avoided == 1
     assert app.metrics.delivered == {"enriched": 0, "raw": 0}
     assert app.metrics.failures == {}
+
+
+# --- Batch 2 item F: /metrics gauge for the gatherer's empty-streak counters ---
+
+def test_render_collector_empty_streaks_empty_when_no_gatherer_wired():
+    from nuncio.server import _render_collector_empty_streaks
+
+    class NoGathererEngine:
+        pass
+
+    app = types.SimpleNamespace(engine=NoGathererEngine())
+    assert _render_collector_empty_streaks(app) == ""
+
+
+def test_render_collector_empty_streaks_renders_a_gauge_per_collector():
+    from nuncio.server import _render_collector_empty_streaks
+
+    class FakeGatherer:
+        def empty_streaks(self):
+            return {"recent_logs": 3, "correlated": 0}
+
+    app = types.SimpleNamespace(engine=types.SimpleNamespace(gatherer=FakeGatherer()))
+    text = _render_collector_empty_streaks(app)
+    assert 'nuncio_collector_empty_streak{collector="recent_logs"} 3' in text
+    assert 'nuncio_collector_empty_streak{collector="correlated"} 0' in text
 
 
 def test_metrics_render_includes_duplicates_avoided():

@@ -439,6 +439,16 @@ def _collectors_block(app):
             "last_error": st.get("last_error"),
             "fail_24h": st.get("fail_count", 0),  # process-lifetime count, see CollectorHealth
         }
+    # Batch 2 item F: per-gatherer-collector consecutive-empty streaks (see
+    # nuncio.gatherer.Gatherer.empty_streaks). A DIFFERENT key-space than
+    # the per-backend entries above (e.g. "recent_logs"/"correlated" vs.
+    # "logs"/"containers"/"metrics" -- note "metrics" is a name in BOTH
+    # spaces, which is exactly why this lives under its own nested key
+    # rather than flattened into `out` directly), nested here rather than
+    # as a new top-level stats.json key since it's still collector health
+    # data. Empty ({}) when no gatherer is wired (Level A / tests).
+    gatherer = getattr(getattr(app, "engine", None), "gatherer", None)
+    out["empty_streaks"] = gatherer.empty_streaks() if gatherer is not None else {}
     return out
 
 

@@ -33,6 +33,36 @@ _CATEGORY_COLLECTORS = {
     "generic": ["recent_logs", "correlated", "recurrence"],
 }
 
+# Batch 2 item F: best-effort "this collector's query succeeded but found
+# nothing" detector, keyed by the fixed phrasing the built-in
+# nuncio.collectors functions use for their own empty case (see
+# collectors.py). This is deliberately a closed, conservative heuristic: a
+# custom/injected collector name absent from this table, or a result that
+# doesn't match its marker, is simply never counted as "empty" -- a false
+# negative here only means a degraded collector goes unnoticed a little
+# longer, whereas a false positive would misreport a collector that's
+# actually returning real data. Never touched for a name this dict doesn't
+# know about.
+_EMPTY_MARKERS = {
+    "recent_logs": ("(no matching log lines)",),
+    "container_state": ("(container not found)",),
+    "metrics": ("\n(none)",),
+    "kernel": ("(no matching lines)",),
+    # Covers both "(none in the last <n> min)" (no alert context) and
+    # "(none related in the last <n> min)" (causal-entity gate excluded
+    # every row) -- both start the same way right after the newline.
+    "correlated": ("\n(none",),
+    "recurrence": ("(no stable signature for this alert)", "(first occurrence in"),
+    "history": ("(no related alerts)",),
+}
+
+
+def _looks_empty(name, text):
+    markers = _EMPTY_MARKERS.get(name)
+    if not markers or not isinstance(text, str):
+        return False
+    return any(m in text for m in markers)
+
 
 class Gatherer:
     def __init__(self, collectors, timeout_s=5.0, max_bytes=16000, max_concurrency=8,
@@ -49,6 +79,28 @@ class Gatherer:
         self.timeout_s = timeout_s
         self.max_bytes = max_bytes
         self._sem = threading.BoundedSemaphore(max_concurrency)
+        # Batch 2 item F: name -> consecutive-empty count. A successful
+        # query recognized as empty (see _looks_empty) increments; any
+        # non-empty result resets to 0. A collector that raised/timed out
+        # is a different signal (failure, not "found nothing") and leaves
+        # this untouched.
+        self._empty_streak = {}
+        self._empty_streak_lock = threading.Lock()
+
+    def empty_streaks(self):
+        """A snapshot copy of the current per-collector consecutive-empty
+        counts -- for /stats.json and the nuncio_collector_empty_streak
+        metric. Never the live dict (a caller must not be able to mutate
+        gatherer state through the snapshot)."""
+        with self._empty_streak_lock:
+            return dict(self._empty_streak)
+
+    def _record_empty_streak(self, name, text):
+        with self._empty_streak_lock:
+            if _looks_empty(name, text):
+                self._empty_streak[name] = self._empty_streak.get(name, 0) + 1
+            else:
+                self._empty_streak[name] = 0
 
     def select(self, alert, profile="low"):
         """Primary category's collectors, plus those of any secondary category
@@ -107,9 +159,15 @@ class Gatherer:
 
             def run(nn=n, ffn=fn):
                 try:
-                    results[nn] = ffn(alert, alert_key, now)
+                    text = ffn(alert, alert_key, now)
+                    results[nn] = text
+                    self._record_empty_streak(nn, text)
                 except Exception:
                     results[nn] = UNAVAIL.format(nn)
+                    # A failure is a different signal (already surfaced via
+                    # CollectorHealth) -- it must never masquerade as
+                    # "queried successfully, found nothing", so the streak
+                    # is left untouched here, not incremented or reset.
                 finally:
                     self._sem.release()
 

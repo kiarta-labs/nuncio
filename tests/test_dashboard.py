@@ -798,6 +798,22 @@ def test_build_stats_collectors_reports_null_pill_for_unwired_client(store):
     assert collectors["logs"]["ok"] is True
 
 
+def test_build_stats_collectors_empty_streaks_absent_without_a_gatherer(store):
+    app = make_app(store)  # no `engine` attribute at all
+    collectors = dashboard.build_stats(app)["collectors"]
+    assert collectors["empty_streaks"] == {}
+
+
+def test_build_stats_collectors_empty_streaks_reflects_the_gatherer(store):
+    class FakeGatherer:
+        def empty_streaks(self):
+            return {"recent_logs": 4}
+
+    app = make_app(store, engine=types.SimpleNamespace(gatherer=FakeGatherer()))
+    collectors = dashboard.build_stats(app)["collectors"]
+    assert collectors["empty_streaks"] == {"recent_logs": 4}
+
+
 def test_build_stats_collectors_reflects_health_tracker(store):
     from nuncio.clients import CollectorHealth
     health = CollectorHealth()
