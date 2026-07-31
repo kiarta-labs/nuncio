@@ -82,6 +82,112 @@ def test_openobserve_query_field_falls_back_to_message_when_invalid():
     assert "1=1" not in captured["sql"]
 
 
+def test_openobserve_query_selects_only_needed_columns_not_star():
+    # SELECT * pulls every column the docker stream carries (container_id,
+    # image, container_created_at, ...) for every matching row -- narrow it
+    # to just what this client actually uses.
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", transport=fake_transport)
+    client.query("web-1")
+    sql = captured["sql"]
+    assert "select *" not in sql.lower()
+    assert sql.startswith("SELECT _timestamp, message FROM")
+
+
+def test_openobserve_query_filters_unit_against_the_unit_field_column_by_default():
+    # container_name is the docker stream's actual label column (verified
+    # against the live deployment) -- filtering on it directly is far more
+    # precise than only substring-matching the unit name against the
+    # message text, which also matches any line that merely MENTIONS the
+    # service name.
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", transport=fake_transport)
+    client.query("web-1", "sonarr")
+    sql = captured["sql"]
+    assert "str_match_ignore_case(container_name, 'sonarr')" in sql
+    assert "container_name" in sql.split("FROM")[0]  # also selected
+
+
+def test_openobserve_query_unit_field_clause_absent_without_a_unit():
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", transport=fake_transport)
+    client.query("web-1")  # no unit
+    sql = captured["sql"]
+    assert "container_name" not in sql
+
+
+def test_openobserve_query_unit_field_disabled_by_empty_string_keeps_old_behavior():
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", unit_field="", transport=fake_transport)
+    client.query("web-1", "sonarr")
+    sql = captured["sql"]
+    assert "container_name" not in sql
+    assert "str_match_ignore_case(message, 'sonarr')" in sql
+
+
+def test_openobserve_query_unit_field_is_configurable():
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", unit_field="app", transport=fake_transport)
+    client.query("web-1", "sonarr")
+    sql = captured["sql"]
+    assert "str_match_ignore_case(app, 'sonarr')" in sql
+    assert "container_name" not in sql
+
+
+def test_openobserve_query_invalid_unit_field_falls_back_to_disabled():
+    # Same validation discipline as `field`: an unvalidated value would be
+    # interpolated straight into the SQL as a column name (injection
+    # vector). Unlike `field` (which has a safe named default to fall back
+    # to), an unrecognized unit-field name has no guaranteed-correct
+    # default column to substitute, so an invalid value disables the
+    # unit-column filter entirely rather than guessing.
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", unit_field="bad; DROP TABLE x --",
+                                transport=fake_transport)
+    client.query("web-1", "sonarr")
+    sql = captured["sql"]
+    assert "DROP TABLE" not in sql
+    assert "str_match_ignore_case(message, 'sonarr')" in sql  # still matched via message
+
+
+def test_escape_sql_doubles_backslashes_before_escaping_quotes():
+    from nuncio.clients.logs import _escape_sql
+
+    assert _escape_sql("a\\b") == "a\\\\b"
+    assert _escape_sql("a'b") == "a''b"
+    assert _escape_sql("a\\'b") == "a\\\\''b"
+
+
 def test_openobserve_query_includes_window_as_microsecond_bounds():
     captured = {}
 
