@@ -31,6 +31,69 @@ def test_gather_runs_selected_collectors_and_assembles():
     assert "## Correlated" in bundle
 
 
+# --- Batch 2 item F: per-collector consecutive-empty streak ---
+
+def test_empty_streak_increments_when_result_matches_its_empty_marker():
+    collectors = {
+        "recent_logs": lambda a, k, n: "## Recent logs (h/u, last 15m)\n(no matching log lines)",
+        "correlated": lambda a, k, n: "## Correlated alerts\nsomething real",
+    }
+    g = Gatherer(collectors, timeout_s=2.0)
+    alert = {"service": "sonarr"}  # categorizes to "container"
+    g.gather(alert, "k1", now=1000.0)
+    assert g.empty_streaks()["recent_logs"] == 1
+    g.gather(alert, "k1", now=1001.0)
+    assert g.empty_streaks()["recent_logs"] == 2
+
+
+def test_empty_streak_resets_on_a_non_empty_result():
+    state = {"empty": True}
+
+    def recent_logs(a, k, n):
+        if state["empty"]:
+            return "## Recent logs\n(no matching log lines)"
+        return "## Recent logs\nan actual matching line"
+
+    collectors = {"recent_logs": recent_logs, "correlated": lambda a, k, n: "## Correlated\nx"}
+    g = Gatherer(collectors, timeout_s=2.0)
+    alert = {"service": "sonarr"}
+    g.gather(alert, "k1", now=1000.0)
+    assert g.empty_streaks()["recent_logs"] == 1
+    state["empty"] = False
+    g.gather(alert, "k1", now=1001.0)
+    assert g.empty_streaks()["recent_logs"] == 0
+
+
+def test_empty_streak_unaffected_by_a_collector_exception():
+    def boom(a, k, n):
+        raise RuntimeError("boom")
+
+    collectors = {"recent_logs": boom, "correlated": lambda a, k, n: "## Correlated\nx"}
+    g = Gatherer(collectors, timeout_s=2.0)
+    alert = {"service": "sonarr"}
+    g.gather(alert, "k1", now=1000.0)
+    # Failure is a DIFFERENT signal (already surfaced via CollectorHealth) --
+    # it must never masquerade as "queried successfully, found nothing".
+    assert g.empty_streaks().get("recent_logs", 0) == 0
+
+
+def test_empty_streak_not_tracked_for_text_with_no_known_empty_marker():
+    collectors = {"correlated": lambda a, k, n: "## Correlated alerts\nsome unrelated free text"}
+    g = Gatherer(collectors, timeout_s=2.0)
+    g.gather({"service": "sonarr"}, "k1", now=1000.0)
+    assert g.empty_streaks().get("correlated", 0) == 0
+
+
+def test_empty_streaks_returns_a_copy_not_the_live_dict():
+    collectors = {"recent_logs": lambda a, k, n: "## Recent logs\n(no matching log lines)",
+                  "correlated": lambda a, k, n: "## Correlated\nx"}
+    g = Gatherer(collectors, timeout_s=2.0)
+    g.gather({"service": "sonarr"}, "k1", now=1000.0)
+    snap = g.empty_streaks()
+    snap["recent_logs"] = 999
+    assert g.empty_streaks()["recent_logs"] == 1  # mutation didn't leak back
+
+
 def test_slow_collector_degrades_to_unavailable():
     def slow(a, k, n):
         time.sleep(3)

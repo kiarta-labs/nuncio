@@ -476,6 +476,23 @@ class App:
             time.sleep(self.maint_interval)
 
 
+def _render_collector_empty_streaks(app):
+    """Prometheus gauge lines for the gatherer's per-collector
+    consecutive-empty streaks (Batch 2 item F -- see
+    nuncio.gatherer.Gatherer.empty_streaks). A gauge, not a counter: it can
+    go back down to 0 the moment a collector starts returning real data
+    again, which is exactly the signal worth alerting on staying high.
+    Empty string when no gatherer is wired (Level A, or a test double)."""
+    gatherer = getattr(getattr(app, "engine", None), "gatherer", None)
+    if gatherer is None:
+        return ""
+    lines = [
+        f'nuncio_collector_empty_streak{{collector="{name}"}} {n}'
+        for name, n in gatherer.empty_streaks().items()
+    ]
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
 def _handler_factory(app):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body=b"", ctype="text/plain"):
@@ -492,7 +509,7 @@ def _handler_factory(app):
             if path == "/health":
                 self._send(200, b"ok") if app.healthy() else self._send(503, b"unhealthy")
             elif path == "/metrics":
-                self._send(200, app.metrics.render().encode())
+                self._send(200, (app.metrics.render() + _render_collector_empty_streaks(app)).encode())
             elif path == "/sources":
                 body = json.dumps({
                     "registered": sources.names(),
