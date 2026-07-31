@@ -8,6 +8,8 @@ safety net).
 """
 import time
 
+from nuncio.delivery import SendTimeout
+
 
 class Retrying:
     def __init__(self, adapter, retries=3, sleep=time.sleep, backoff=0.5):
@@ -36,6 +38,12 @@ class Retrying:
             try:
                 if self.adapter.send(title, body, severity, **kw):
                     return True
+            except SendTimeout:
+                # The send may have already reached the far end (the POST is
+                # non-idempotent) -- retrying risks a duplicate push, so give
+                # up on this key now rather than retry like a transient
+                # connection failure. See SendTimeout's docstring.
+                return False
             except Exception:
                 pass  # treated as a failed attempt; retry below
             if i < attempts - 1:

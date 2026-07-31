@@ -33,7 +33,7 @@ class Telegram(DeliveryAdapter):
         self.bot_token = cfg.get("bot_token") or None
         self.chat_id = cfg.get("chat_id") or None
         self._transport = transport or _urllib_transport
-        self.timeout = timeout
+        self.timeout = cfg.get("timeout", timeout)
 
     def send(self, title, body, severity="unknown", **kw):
         if not self.bot_token or not self.chat_id:

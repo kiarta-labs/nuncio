@@ -4,6 +4,12 @@ configured" signal) is correctly treated as delivery failure, not success —
 trusting it as success would silently black-hole every alert. Covers a
 single delivery attempt; retry behavior lives in Retrying, tested
 separately."""
+import socket
+import urllib.error
+
+import pytest
+
+from nuncio.delivery import SendTimeout
 from nuncio.delivery.apprise import Apprise
 
 
@@ -61,6 +67,45 @@ def test_transport_exception_propagates_for_retrying_to_catch():
     import pytest
     with pytest.raises(ConnectionError):
         a.send("title", "hello")
+
+
+def test_socket_timeout_raises_send_timeout_not_the_raw_exception():
+    # A raw timeout propagating as a generic exception is indistinguishable
+    # from connection-refused to Retrying, which retries both -- but a POST
+    # timeout is non-idempotent and may already have reached Apprise/Bark
+    # (the 4x-duplicate-push bug). The adapter must surface a distinct,
+    # typed SendTimeout so the caller can choose not to retry it.
+    def boom(url, payload, timeout=10):
+        raise socket.timeout("timed out")
+    a = Apprise({"url": "http://x"}, transport=boom)
+    with pytest.raises(SendTimeout):
+        a.send("title", "hello")
+
+
+def test_urlerror_wrapping_a_timeout_reason_raises_send_timeout():
+    def boom(url, payload, timeout=10):
+        raise urllib.error.URLError(socket.timeout("timed out"))
+    a = Apprise({"url": "http://x"}, transport=boom)
+    with pytest.raises(SendTimeout):
+        a.send("title", "hello")
+
+
+def test_connection_error_still_propagates_as_itself_not_send_timeout():
+    # Connection-refused/5xx-shaped failures are NOT timeouts -- Retrying
+    # must keep retrying those as today, so they must not be reclassified.
+    def boom(url, payload, timeout=10):
+        raise ConnectionError("down")
+    a = Apprise({"url": "http://x"}, transport=boom)
+    with pytest.raises(ConnectionError):
+        a.send("title", "hello")
+
+
+def test_timeout_config_reaches_the_transport_call():
+    a, t = make([200])
+    a2 = Apprise({"url": "http://x", "timeout": 45}, transport=t)
+    a2.send("t", "b")
+    _, _, used_timeout = t.calls[0]
+    assert used_timeout == 45
 
 
 def test_send_rejects_non_http_scheme(monkeypatch):

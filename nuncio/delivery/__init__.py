@@ -14,6 +14,17 @@ import urllib.parse
 _REGISTRY = {}  # name -> class (NOT an instance — construction needs per-adapter cfg)
 
 
+class SendTimeout(Exception):
+    """Raised by a delivery adapter when a send attempt failed because the
+    transport timed out, as opposed to a connection refusal or an HTTP
+    error status. A timeout is NOT safely retryable: the POST is
+    non-idempotent, and the far end (e.g. Apprise, which then forwards to
+    Bark) may already have accepted and acted on it before the response was
+    lost. `Retrying` treats this distinctly from every other failure mode —
+    it stops after the one attempt instead of retrying, trading a possible
+    missed delivery for never duplicating a push."""
+
+
 def require_http_url(url):
     """Reject any URL whose scheme isn't http/https -- same allowlist
     clients/http.py already enforces on the ingest/collector side, applied

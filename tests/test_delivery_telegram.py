@@ -31,6 +31,13 @@ def test_missing_config_fails_closed():
     assert t.calls == []
 
 
+def test_timeout_config_reaches_the_transport_call():
+    t = Transport([(200, {"ok": True})])
+    tg = Telegram({"bot_token": "tok", "chat_id": "1", "timeout": 45}, transport=t)
+    tg.send("t", "b")
+    assert t.calls[0][2] == 45
+
+
 def test_api_error_returns_false():
     t = Transport([(200, {"ok": False, "description": "blocked"})])
     tg = Telegram({"bot_token": "tok", "chat_id": "1"}, transport=t)

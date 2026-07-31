@@ -70,6 +70,13 @@ def test_failure_status_returns_false():
     assert w.send("t", "b") is False
 
 
+def test_timeout_config_reaches_the_transport_call():
+    t = Transport(200)
+    w = Webhook({"url": "http://x", "timeout": 45}, transport=t)
+    w.send("t", "b")
+    assert t.calls[0][3] == 45
+
+
 def test_send_rejects_non_http_scheme(monkeypatch):
     # Operator-config-only exposure (consistency with clients/http.py's
     # scheme allowlist), but a misconfigured file:// URL must never even

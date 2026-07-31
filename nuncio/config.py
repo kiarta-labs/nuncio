@@ -99,6 +99,8 @@ _SCHEMA = {
     "NUNCIO_EMAIL_TO": ("", str),
     "NUNCIO_EMAIL_TLS": ("starttls", str),
     "NUNCIO_DELIVERY_VERBOSITY": ("{}", str),
+    "NUNCIO_DELIVERY_TIMEOUT_S": (30.0, float),
+    "NUNCIO_DELIVERY_RETRIES": (3, int),
     "NUNCIO_MODE": ("enriched", str),
     "NUNCIO_DATA_DIR": ("/data", str),
     "NUNCIO_PORT": (8095, int),
@@ -292,6 +294,14 @@ UI_EDITABLE = {
                                        label="Per-adapter verbosity override (JSON)",
                                        help='JSON map of adapter name -> "brief" | "full", overlaying the built-in '
                                             "default per-adapter verbosity."),
+    "NUNCIO_DELIVERY_TIMEOUT_S": _spec("NUNCIO_DELIVERY_TIMEOUT_S", category="live", type="float", min=1, max=300,
+                                       group="delivery", label="Delivery HTTP timeout (seconds)",
+                                       help="Socket timeout for the HTTP-based delivery adapters (apprise, ntfy, "
+                                            "telegram, slack, webhook); not used by email or stdout."),
+    "NUNCIO_DELIVERY_RETRIES": _spec("NUNCIO_DELIVERY_RETRIES", category="live", type="int", min=0, max=10,
+                                     group="delivery", label="Delivery retry attempts",
+                                     help="Extra attempts after the first, with exponential backoff. A timeout "
+                                          "is never retried regardless of this value -- see SendTimeout."),
     "NUNCIO_EVIDENCE_MAX_BYTES": _spec("NUNCIO_EVIDENCE_MAX_BYTES", category="live", type="int", min=1000, max=500000,
                                        group="delivery", label="Evidence section cap (bytes)",
                                        help="Cap on the labeled evidence sections (logs/metrics/container state/"
@@ -944,6 +954,7 @@ _DELIVERY_KEYS = frozenset({
     "NUNCIO_WEBHOOK_URL", "NUNCIO_WEBHOOK_HEADERS", "NUNCIO_WEBHOOK_TEMPLATE", "NUNCIO_DELIVERY_TITLE",
     "NUNCIO_EMAIL_SMTP_HOST", "NUNCIO_EMAIL_SMTP_PORT", "NUNCIO_EMAIL_USER", "NUNCIO_EMAIL_PASSWORD",
     "NUNCIO_EMAIL_FROM", "NUNCIO_EMAIL_TO", "NUNCIO_EMAIL_TLS", "NUNCIO_DELIVERY_VERBOSITY",
+    "NUNCIO_DELIVERY_TIMEOUT_S", "NUNCIO_DELIVERY_RETRIES",
 })
 _GATHERER_KEYS = frozenset({
     "NUNCIO_GATHER_TIMEOUT_S", "NUNCIO_BUNDLE_MAX_BYTES", "NUNCIO_CORRELATION_WINDOW_S",
@@ -1230,15 +1241,20 @@ def log_startup_config(settings):
 # --- delivery ring wiring ---
 
 def _delivery_cfg_by_name(settings):
+    # NUNCIO_DELIVERY_TIMEOUT_S is threaded only into the HTTP-based adapters
+    # (they all share the same `cfg.get("timeout", <default>)` constructor
+    # pattern) -- email has its own SMTP timeout concept and stdout has no
+    # transport at all, so neither carries a "timeout" key here.
+    http_timeout = settings.NUNCIO_DELIVERY_TIMEOUT_S
     return {
-        "apprise": {"url": settings.NUNCIO_APPRISE_URL},
+        "apprise": {"url": settings.NUNCIO_APPRISE_URL, "timeout": http_timeout},
         "ntfy": {"url": settings.NUNCIO_NTFY_URL, "topic": settings.NUNCIO_NTFY_TOPIC,
-                 "token": settings.NUNCIO_NTFY_TOKEN or None},
+                 "token": settings.NUNCIO_NTFY_TOKEN or None, "timeout": http_timeout},
         "telegram": {"bot_token": settings.NUNCIO_TELEGRAM_BOT_TOKEN,
-                     "chat_id": settings.NUNCIO_TELEGRAM_CHAT_ID},
-        "slack": {"webhook_url": settings.NUNCIO_SLACK_WEBHOOK_URL},
+                     "chat_id": settings.NUNCIO_TELEGRAM_CHAT_ID, "timeout": http_timeout},
+        "slack": {"webhook_url": settings.NUNCIO_SLACK_WEBHOOK_URL, "timeout": http_timeout},
         "webhook": {"url": settings.NUNCIO_WEBHOOK_URL, "headers": settings.webhook_headers,
-                    "template": settings.NUNCIO_WEBHOOK_TEMPLATE or None},
+                    "template": settings.NUNCIO_WEBHOOK_TEMPLATE or None, "timeout": http_timeout},
         "email": {"smtp_host": settings.NUNCIO_EMAIL_SMTP_HOST, "smtp_port": settings.NUNCIO_EMAIL_SMTP_PORT,
                   "user": settings.NUNCIO_EMAIL_USER, "password": settings.NUNCIO_EMAIL_PASSWORD,
                   "from_addr": settings.NUNCIO_EMAIL_FROM, "to": settings.NUNCIO_EMAIL_TO,
@@ -1264,7 +1280,8 @@ def build_delivery(settings):
                 f"{', '.join(delivery_ring.names())}"
             )
         adapter = delivery_ring.build(name, cfg_by_name.get(name, {}))
-        channels.append((name, delivery_ring.Retrying(adapter), _verbosity_for(name, settings)))
+        channels.append((name, delivery_ring.Retrying(adapter, retries=settings.NUNCIO_DELIVERY_RETRIES),
+                          _verbosity_for(name, settings)))
     return delivery_ring.Dispatch(channels)
 
 

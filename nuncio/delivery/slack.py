@@ -23,7 +23,7 @@ class Slack(DeliveryAdapter):
         cfg = cfg or {}
         self.url = cfg.get("webhook_url") or None
         self._transport = transport or _urllib_transport
-        self.timeout = timeout
+        self.timeout = cfg.get("timeout", timeout)
 
     def send(self, title, body, severity="unknown", **kw):
         if not self.url:
