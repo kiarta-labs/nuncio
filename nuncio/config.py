@@ -1576,11 +1576,30 @@ def _load_dashboard_assets():
     return logo_bytes, favicon_data_uri
 
 
+def _knowledge_status(settings):
+    """Human-facing status string for the settings/dashboard payload --
+    `enabled` stays a plain bool (existing consumers depend on that), but a
+    bare "enabled: true" is misleading in the common (homelab-default)
+    configuration where the knowledge plane inherits the private plane's
+    endpoint+model AND full depth is the configured default: in that exact
+    combination Engine._garnish_with_knowledge's redundancy skip means the
+    garnish never actually fires, so "enabled" alone reads as active when
+    it is not. See that method's docstring for the full reasoning."""
+    if not settings.NUNCIO_KNOWLEDGE_ENABLED:
+        return "disabled"
+    if settings.NUNCIO_ENRICH_DEPTH == "full" and _knowledge_redundant_with_private(settings):
+        return ("enabled but redundant with private plane — garnish skipped at full depth "
+                "(same endpoint/model as the private plane; only fires at low depth, or "
+                "with a genuinely distinct knowledge endpoint/model)")
+    return "enabled"
+
+
 def build_plane_info(settings):
     return {
         "private": {"model": settings.NUNCIO_LLM_MODEL},
         "knowledge": {
             "enabled": settings.NUNCIO_KNOWLEDGE_ENABLED,
+            "status": _knowledge_status(settings),
             "model": settings.knowledge_model if settings.NUNCIO_KNOWLEDGE_ENABLED else None,
             "data": "anonymised problem-class only",
             "active_when": "low depth, or a distinct knowledge endpoint/model",

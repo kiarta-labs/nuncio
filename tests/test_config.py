@@ -728,6 +728,49 @@ def test_build_plane_info_knowledge_model_reflects_inheritance_when_unset():
     assert info["knowledge"]["model"] == "private-alias"
 
 
+# --- Batch 2 item I: a bare enabled:true is misleading when the knowledge
+# plane inherits everything from the private plane and full depth is the
+# configured default -- the garnish never actually fires (see
+# Engine._garnish_with_knowledge's redundancy skip). ---
+
+def test_build_plane_info_flags_redundant_knowledge_plane_at_full_depth():
+    # Default settings: knowledge inherits the private plane's URL+model
+    # (redundant) and NUNCIO_ENRICH_DEPTH defaults to "full" -- the exact
+    # homelab-default situation this note exists for.
+    s = config.load_settings(base_env(NUNCIO_LLM_MODEL="private-alias"))
+    info = config.build_plane_info(s)
+    assert info["knowledge"]["enabled"] is True  # unchanged -- still a plain bool
+    assert "redundant with private plane" in info["knowledge"]["status"]
+    assert "garnish skipped at full depth" in info["knowledge"]["status"]
+
+
+def test_build_plane_info_knowledge_status_is_plain_enabled_at_low_depth():
+    # Same redundant configuration, but low depth -- the garnish DOES fire
+    # (Engine._garnish_with_knowledge's skip only applies at full depth), so
+    # the status must not claim it's skipped.
+    s = config.load_settings(base_env(NUNCIO_LLM_MODEL="private-alias", NUNCIO_ENRICH_DEPTH="low"))
+    info = config.build_plane_info(s)
+    assert info["knowledge"]["enabled"] is True
+    assert info["knowledge"]["status"] == "enabled"
+
+
+def test_build_plane_info_knowledge_status_is_plain_enabled_with_a_distinct_endpoint():
+    s = config.load_settings(base_env(
+        NUNCIO_KNOWLEDGE_ENABLED="true", NUNCIO_KNOWLEDGE_URL="http://gw:4000",
+        NUNCIO_KNOWLEDGE_MODEL="gemini-alias",
+    ))
+    info = config.build_plane_info(s)
+    assert info["knowledge"]["enabled"] is True
+    assert info["knowledge"]["status"] == "enabled"
+
+
+def test_build_plane_info_knowledge_status_disabled():
+    s = config.load_settings(base_env(NUNCIO_KNOWLEDGE_ENABLED="false"))
+    info = config.build_plane_info(s)
+    assert info["knowledge"]["enabled"] is False
+    assert info["knowledge"]["status"] == "disabled"
+
+
 def test_collector_impl_names_reports_null_for_the_null_client():
     from nuncio.clients import NullClient
     n = NullClient()
