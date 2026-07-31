@@ -412,7 +412,10 @@ class Engine:
         if defer:
             ok = self.delivery.send_brief(envelope)
             if ok:
-                self.store.mark_delivered(key, "enriched")
+                try:
+                    self.store.mark_delivered(key, "enriched")
+                except Exception:
+                    pass  # delivered; a failed mark only risks an accepted drain dup
                 self._record_stats(key, outcome="enriched", tokens=usage,
                                     llm_ms=meta.get("llm_ms"),
                                     redaction_count=meta.get("redaction_count"),
@@ -447,7 +450,10 @@ class Engine:
             # all-channel send below rather than stranding the alert.
 
         if self.delivery.send(envelope):
-            self.store.mark_delivered(key, "enriched")
+            try:
+                self.store.mark_delivered(key, "enriched")
+            except Exception:
+                pass  # delivered; a failed mark only risks an accepted drain dup
             self._record_stats(key, outcome="enriched", tokens=usage,
                                 llm_ms=meta.get("llm_ms"),
                                 redaction_count=meta.get("redaction_count"),

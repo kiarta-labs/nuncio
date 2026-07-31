@@ -2158,6 +2158,26 @@ def test_deliver_raw_belt_fails_open_on_store_get_status_exception(store, monkey
     assert len(dlv.sent) == 1
 
 
+def test_deliver_enriched_survives_mark_delivered_failure(store, monkeypatch):
+    # Mirrors test_deliver_raw_survives_mark_delivered_failure: if
+    # mark_delivered raises AFTER a successful send, process()'s outer
+    # except must not treat that as a failure and re-deliver via
+    # _deliver_raw (a double push) -- the mark failure is non-fatal, the
+    # alert already went out.
+    store.persist("k1", RAW)
+    llm = FakeLLM([("ok", VALID)])
+    dlv = FakeDelivery()
+    eng = make_engine(store, llm, dlv, FakeClock())
+
+    def boom(*a, **k):
+        raise RuntimeError("mark_delivered broke")
+    monkeypatch.setattr(store, "mark_delivered", boom)
+
+    outcome = eng.process("k1", ALERT, RAW)
+    assert outcome == "enriched"
+    assert len(dlv.sent) == 1  # sent exactly once -- no fallback double-push
+
+
 def test_deliver_enriched_belt_fails_open_on_store_get_status_exception(store, monkeypatch):
     store.persist("k1", RAW)
     llm = FakeLLM([("ok", VALID)])
