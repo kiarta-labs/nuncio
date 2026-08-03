@@ -76,14 +76,15 @@ VALID_ENRICH_FORMATS = ("auto", "text")
 VALID_DEPTHS = ("full", "low")
 
 # Phase B ladder constants -- see Engine._enrich_full's docstring for the
-# full worked budget walkthrough (10 gather + 15 triage + 30 RCA + 3 delivery
-# reserve = 58s <= the 60s default NUNCIO_FULL_BUDGET_S).
+# full worked budget walkthrough (10 gather + 15 triage + 45 RCA + 3 delivery
+# reserve = 73s <= a 90s NUNCIO_FULL_BUDGET_S; the code default is 60s (the
+# min() caps in the ladder clamp the bounds to whatever time actually remains).
 _FULL_POST_GATHER_RESERVE_S = 48.0   # gather gate: skip the 2-call flow below this much remaining
 _FULL_GATHER_BOUND_S = 10.0          # network-collector gather budget cap
 _FULL_TRIAGE_MIN_REMAINING_S = 38.0  # below this, skip the triage call entirely
 _FULL_TRIAGE_BOUND_S = 15.0          # triage call's own bound cap
 _FULL_TRIAGE_RESERVE_S = 35.0        # reserved for call 2 + delivery when sizing the triage bound
-_FULL_RCA_BOUND_S = 30.0             # deep RCA call's bound cap
+_FULL_RCA_BOUND_S = 45.0             # deep RCA call's bound cap
 _FULL_RCA_DELIVERY_RESERVE_S = 3.0   # reserved for delivery after the RCA call
 _FULL_RCA_TIGHT_MIN_S = 8.0          # below this bound, RCA degrades to a single tight-bound attempt
 _FULL_MAX_BUNDLE_BYTES = 64000       # hard cap on the deep bundle, regardless of NUNCIO_BUNDLE_MAX_BYTES
@@ -193,7 +194,8 @@ class Engine:
                  fingerprint_window_s=172800, evidence_max_bytes=32000,
                  assist=None, enrich_format="auto",
                  depth="full", full_budget_s=60.0,
-                 flap_threshold=0, flap_window_s=10800, flap_cooldown_s=3600):
+                 flap_threshold=0, flap_window_s=10800, flap_cooldown_s=3600,
+                 metrics=None):
         if mode not in VALID_MODES:
             raise ValueError(f"invalid NUNCIO_MODE: {mode!r}; must be one of {VALID_MODES}")
         if enrich_format not in VALID_ENRICH_FORMATS:
@@ -261,6 +263,24 @@ class Engine:
         self.flap_threshold = flap_threshold
         self.flap_window_s = flap_window_s
         self.flap_cooldown_s = flap_cooldown_s
+        # Optional Metrics sink (server.Metrics in the composed app; None for
+        # hand-built engines in the test suite). Additive and optional so no
+        # existing Engine(...) call site changes. `_inc_abandoned` guards the
+        # attribute so a metrics object that predates this counter can't
+        # AttributeError.
+        self.metrics = metrics
+
+    def _inc_abandoned(self):
+        """Count one abandoned LLM attempt (hard-timeout branch of
+        `_call_bounded`). Best-effort, never raises -- the dashboard counter
+        `nuncio_llm_abandoned_total` is the watchdog for LLM calls that were
+        abandoned at their bound (thread leaked until the socket timeout),
+        which is otherwise only visible via the llm-failure aggregate."""
+        try:
+            if self.metrics is not None:
+                self.metrics.inc("llm_abandoned")
+        except Exception:
+            pass
 
     def process(self, key, alert, raw_text, deadline=None, mode=None, depth=None):
         """Enrich + deliver one already-persisted alert. Returns
@@ -403,7 +423,8 @@ class Engine:
         except Exception as e:
             # ANY failure (LLM, validation, deadline, internal) -> raw + marker.
             raw_with_note = f"{raw_text.rstrip()}\n\n{flap_note}" if flap_note else raw_text
-            return self._deliver_raw(key, raw_with_note, fail_stage=self._classify_failure(e), alert=alert)
+            llm_ms = getattr(e, "llm_ms", None)  # hard-timeout branch of _call_bounded records it; others stay None
+            return self._deliver_raw(key, raw_with_note, fail_stage=self._classify_failure(e), alert=alert, llm_ms=llm_ms)
 
     def _delivery_has_verbosity(self, verbosity):
         """Duck-typed `self.delivery.has_verbosity(verbosity)` -- see the
@@ -808,7 +829,7 @@ class Engine:
                 have made, just with the store-only sections (incl.
                 `history`) merged into its bundle -- see `_gather_standard`.
               * enough time for the network gather + deep bundle but not
-                the full 30s RCA call -> a single tight-bound RCA attempt
+                the full 45s RCA call -> a single tight-bound RCA attempt
                 (no retry) rather than none at all.
               * genuinely out of time even for that -> `_Fallback("deadline")`
                 (-> the caller's existing raw-fallback path, same as any
@@ -818,8 +839,10 @@ class Engine:
             this engine uses, so its output is structured-JSON-rendered,
             redacted, and validated exactly like a standard call.
 
-        Ledger at the defaults (NUNCIO_FULL_BUDGET_S=60): 10s gather + 15s
-        triage + 30s RCA + 3s delivery reserve = 58s <= 60s."""
+        Ledger for the full-depth ladder at a 90s NUNCIO_FULL_BUDGET_S (the
+        value the homelab deployment sets; the code default is 60s, in which
+        case the min() caps below clamp each bound to the remaining time):
+        10s gather + 15s triage + 45s RCA + 3s delivery reserve = 73s <= 90s."""
         now = self._wall_clock()
         red_alert, redaction_count = self._redact_alert_fields(alert)
         use_structured = self._use_structured()
@@ -924,11 +947,11 @@ class Engine:
         messages = self._build_messages_b(red_alert, bundle_red + triage_block,
                                           structured=use_structured, multi_correlation=True)
         if rca_bound < _FULL_RCA_TIGHT_MIN_S:
-            # Re-derived per the spec's literal wording ("bound = min(30,
+            # Re-derived per the spec's literal wording ("bound = min(45,
             # remaining-3); if bound < 8 -> attempt ONE call iff
             # remaining-3 >= 8, else _Fallback"). NOTE for future
-            # maintainers: because `rca_bound = min(30, remaining2 - 3)` and
-            # 30 is never < 8, `rca_bound < 8` can only be true when
+            # maintainers: because `rca_bound = min(45, remaining2 - 3)` and
+            # 45 is never < 8, `rca_bound < 8` can only be true when
             # `remaining2 - 3 < 8` -- i.e. `tight_bound` below is ALWAYS
             # equal to `rca_bound` inside this branch, so the "attempt ONE
             # call" arm is unreachable as literally specified (this branch
@@ -1145,15 +1168,19 @@ class Engine:
             # this the socket would time out at the client's fixed
             # construction-time NUNCIO_LLM_TIMEOUT_S (default 10s) regardless
             # of a deliberately larger per-call bound (e.g. the full-depth
-            # RCA call's up-to-30s bound), capping the deep RCA call's
-            # actual model time at 10s even when it was budgeted 30s.
+            # RCA call's up-to-45s bound), capping the deep RCA call's
+            # actual model time at 10s even when it was budgeted 45s.
             if response_format is not None:
                 raw = run_bounded(
                     lambda: self.llm.enrich(messages, response_format=response_format, timeout=bound), bound)
             else:
                 raw = run_bounded(lambda: self.llm.enrich(messages, timeout=bound), bound)
         except TimeoutError:
-            raise LLMError("hard timeout", retryable=False)
+            escaped_s = max(0.0, self._wall_clock() - t0)
+            self._inc_abandoned()
+            err = LLMError("hard timeout", retryable=False)
+            err.llm_ms = escaped_s  # seconds, matching _record_stats' seconds convention
+            raise err
         elapsed = max(0.0, self._wall_clock() - t0)
         if isinstance(raw, tuple) and len(raw) == 2:
             content, usage = raw
@@ -1247,7 +1274,7 @@ class Engine:
         except Exception:
             return enrichment_text
 
-    def _deliver_raw(self, key, raw_text, marker=True, fail_stage=None, alert=None):
+    def _deliver_raw(self, key, raw_text, marker=True, fail_stage=None, alert=None, llm_ms=None):
         """The structurally-trivial raw path: a redactor or envelope-build
         exception must NOT strand the alert. Degrade to verbatim raw
         (already secret-masked at ingest, so this can't leak) rather than
@@ -1266,7 +1293,11 @@ class Engine:
         here). `alert`, when the caller has it (process()'s except-branch
         and bypass branch), supplies severity/host/service for the
         headline; the bare call sites (drain_raw, maintenance, worker
-        deadline) don't have it and degrade to a best-effort store lookup."""
+        deadline) don't have it and degrade to a best-effort store lookup.
+        `llm_ms` (seconds, None when unknown -- 5xx/transport raws stay
+        NULL in the dashboard) is threaded to `_record_stats` so a
+        hard-timeout raw row records how long the abandoned LLM attempt
+        actually ran, matching the enriched path's `llm_ms` units."""
         # BLOCKER 2b (Phase B): same fail-OPEN duplicate-delivery belt as
         # `_deliver_enriched` above -- see that method's comment for the
         # full reasoning (the maintenance-thread/worker race this closes,
@@ -1314,7 +1345,7 @@ class Engine:
                 self.store.mark_delivered(key, "raw")
             except Exception:
                 pass  # delivered; a failed mark only risks an accepted drain dup
-            self._record_stats(key, outcome="raw", fail_stage=fail_stage)
+            self._record_stats(key, outcome="raw", fail_stage=fail_stage, llm_ms=llm_ms)
             return "raw"
         return "delivery_failed"
 

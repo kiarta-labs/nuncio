@@ -87,6 +87,12 @@ class Metrics:
         # at status='received' (every maintenance retry exhausted) that got
         # deleted rather than retried forever.
         self.purged_stale_received = 0
+        # Deep-RCA budget pass: LLM calls abandoned at their hard wall-clock
+        # bound (`Engine._call_bounded`'s TimeoutError branch -- the thread
+        # leaks until the socket timeout, so this is the one signal that
+        # distinguishes "LLM endpoint hung past its bound" from a plain
+        # transport failure). The raw fallback watchdog.
+        self.llm_abandoned = 0
 
     def inc(self, attr, key=None, n=1):
         with self._lock:
@@ -115,6 +121,7 @@ class Metrics:
             lines.append(f"nuncio_assist_ok_total {self.assist_ok}")
             lines.append(f"nuncio_assist_failed_total {self.assist_failed}")
             lines.append(f"nuncio_purged_stale_received_total {self.purged_stale_received}")
+            lines.append(f"nuncio_llm_abandoned_total {self.llm_abandoned}")
         return "\n".join(lines) + "\n"
 
 
