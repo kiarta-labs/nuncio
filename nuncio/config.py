@@ -1688,6 +1688,7 @@ def build_app(settings=None, clock=None):
         flap_threshold=settings.NUNCIO_FLAP_THRESHOLD,
         flap_window_s=settings.NUNCIO_FLAP_WINDOW_S,
         flap_cooldown_s=settings.NUNCIO_FLAP_COOLDOWN_S,
+        metrics=metrics,
     )
     logo_bytes, favicon_data_uri = _load_dashboard_assets()
     app = App(

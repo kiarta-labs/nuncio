@@ -2036,7 +2036,7 @@ def test_full_depth_runs_triage_then_rca_within_budget(store):
 def test_full_depth_socket_timeout_tracks_each_calls_own_bound(store):
     # MUST-FIX 1: the HTTP socket timeout on each attempt must track that
     # attempt's own wall-clock bound, not a fixed NUNCIO_LLM_TIMEOUT_S -- the
-    # triage call's bound (~15s here) and the RCA call's bound (~30s here)
+    # triage call's bound (~15s here) and the RCA call's bound (~45s here)
     # differ, and both must reach LLMClient.enrich as `timeout=`, else the
     # deep RCA call could never use more than the short per-attempt default.
     clk = FakeClock()
@@ -2050,7 +2050,7 @@ def test_full_depth_socket_timeout_tracks_each_calls_own_bound(store):
     assert len(llm.timeouts) == 2
     triage_timeout, rca_timeout = llm.timeouts
     assert triage_timeout == pytest.approx(15.0, abs=0.01)
-    assert rca_timeout == pytest.approx(30.0, abs=0.01)
+    assert rca_timeout == pytest.approx(45.0, abs=0.01)
     assert rca_timeout > triage_timeout  # the RCA call must not be capped to the triage bound
 
 
