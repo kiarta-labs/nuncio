@@ -2,6 +2,7 @@
 
 Tested with 0 workers so the queue is inspectable and there are no thread races.
 """
+import logging
 import threading
 import time
 import types
@@ -577,6 +578,19 @@ def test_ingest_401_on_wrong_token(live_server_with_token):
     _app, _store, base = live_server_with_token
     status, _body = _post_with_token(base + "/ingest/generic", {"host": "h", "message": "x"}, "wrong-token")
     assert status == 401
+
+
+def test_ingest_401_logs_warning_and_counts_auth_failure(live_server_with_token, caplog):
+    # F4: a rejected ingest must be LOUD -- structured warning log line plus
+    # the failures{auth} counter -- so a misconfigured sender (the CheckMK
+    # 401 incident) is visible in logs/metrics instead of a silent 401.
+    app, _store, base = live_server_with_token
+    with caplog.at_level(logging.WARNING, logger="nuncio.server"):
+        status, _body = _post_with_token(base + "/ingest/generic", {"host": "h", "message": "x"},
+                                          "wrong-token")
+    assert status == 401
+    assert any("ingest auth failed" in r.getMessage() for r in caplog.records)
+    assert 'nuncio_failures_total{stage="auth"} 1' in app.metrics.render()
 
 
 def test_ingest_200_with_correct_token(live_server_with_token):

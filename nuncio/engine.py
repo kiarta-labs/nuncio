@@ -30,6 +30,7 @@ import time
 from dataclasses import replace as _dc_replace
 
 from nuncio.bundle import assemble_bundle
+from nuncio.circuit import CircuitBreaker
 from nuncio.deadline import Deadline, run_bounded
 from nuncio.envelope import Envelope, build_detail_html, build_headline, severity_to_notify_type
 from nuncio.fingerprint import fingerprint as compute_fingerprint
@@ -195,7 +196,8 @@ class Engine:
                  assist=None, enrich_format="auto",
                  depth="full", full_budget_s=60.0,
                  flap_threshold=0, flap_window_s=10800, flap_cooldown_s=3600,
-                 metrics=None):
+                 metrics=None,
+                 cb_fails=3, cb_window_s=300, cb_cooldown_s=60):
         if mode not in VALID_MODES:
             raise ValueError(f"invalid NUNCIO_MODE: {mode!r}; must be one of {VALID_MODES}")
         if enrich_format not in VALID_ENRICH_FORMATS:
@@ -219,6 +221,14 @@ class Engine:
         self.mode = mode
         self._clock = clock
         self._wall_clock = wall_clock
+        # Circuit breaker over the private-plane LLM funnel (see
+        # nuncio.circuit): trips on `cb_fails` retryable failures within
+        # `cb_window_s`, then fails fast (raw fallback) for `cb_cooldown_s`
+        # before one half-open probe. Hooked in `_call_bounded`, which every
+        # private-plane call (ladder attempts, triage, RCA) funnels through;
+        # the knowledge-plane garnish calls `run_bounded` directly and is
+        # deliberately NOT covered.
+        self.breaker = CircuitBreaker(cb_fails, cb_window_s, cb_cooldown_s, clock=self._clock)
         # Knowledge plane: `router` gates which alert classes may reach it
         # (allowlist by construction -- see nuncio.router.Router),
         # `knowledge_llm` is the second LLMClient it's actually called
@@ -1160,6 +1170,13 @@ class Engine:
         never allowed to run past the alert's own deadline."""
         eff_per_attempt = bound if bound is not None else self.per_attempt_s
         bound = min(eff_per_attempt, max(0.1, deadline.remaining()))
+        if not self.breaker.allow():
+            raise LLMError(
+                f"LLM circuit open after {self.breaker.failure_count} retryable "
+                f"failure(s) within {self.breaker.window_s}s (cooldown "
+                f"{self.breaker.cooldown_left():.0f}s remaining)",
+                retryable=False,
+            )
         t0 = self._wall_clock()
         try:
             # MUST-FIX 1: thread THIS attempt's own wall-clock bound through
@@ -1181,6 +1198,11 @@ class Engine:
             err = LLMError("hard timeout", retryable=False)
             err.llm_ms = escaped_s  # seconds, matching _record_stats' seconds convention
             raise err
+        except LLMError as e:
+            if e.retryable:
+                self.breaker.record_failure()
+            raise
+        self.breaker.record_success()
         elapsed = max(0.0, self._wall_clock() - t0)
         if isinstance(raw, tuple) and len(raw) == 2:
             content, usage = raw

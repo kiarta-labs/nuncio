@@ -575,6 +575,8 @@ def _handler_factory(app):
                 if auth_header[:7].lower() == "bearer ":
                     bearer_ok = hmac.compare_digest(auth_header[7:], app.token)
                 if not (xauth_ok or bearer_ok):
+                    log.warning("ingest auth failed: path=%s", path)
+                    app.metrics.inc("failures", "auth")
                     self._send(401, b"unauthorized")
                     return
             try:

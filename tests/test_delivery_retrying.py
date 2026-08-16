@@ -1,6 +1,8 @@
 """Generic bounded-retry wrapper. Tests `Retrying` wrapping a fake
 DeliveryAdapter, since retry behavior lives in this shared wrapper rather
 than in any single adapter."""
+import logging
+
 from nuncio.delivery import SendTimeout
 from nuncio.delivery.retrying import Retrying
 
@@ -100,3 +102,35 @@ def test_durable_reflects_wrapped_adapter():
     assert Retrying(durable_adapter).durable is True
     assert Retrying(non_durable_adapter).durable is False
     assert Retrying(no_attr_adapter).durable is True  # default, same as getattr(..., True)
+
+
+def test_each_failed_attempt_logs_debug_and_exhaustion_warns(caplog):
+    # F1: delivery failures must be visible per-attempt (DEBUG) and at
+    # exhaustion (WARNING) instead of the historical silent `except: pass`.
+    r, a, slept = make([False, False, False, False])  # 4 attempts, all fail
+    with caplog.at_level(logging.DEBUG, logger="nuncio.delivery.retrying"):
+        assert r.send("title", "hello") is False
+    records = [rec for rec in caplog.records if rec.name == "nuncio.delivery.retrying"]
+    assert sum(1 for rec in records if rec.levelno == logging.DEBUG) == 4
+    assert any(rec.levelno == logging.WARNING and "exhausted" in rec.getMessage()
+               for rec in records)
+
+
+def test_raised_channel_error_logs_debug_with_error_details(caplog):
+    r, a, slept = make(["raise", True])
+    with caplog.at_level(logging.DEBUG, logger="nuncio.delivery.retrying"):
+        assert r.send("title", "hello") is True
+    records = [rec for rec in caplog.records if rec.name == "nuncio.delivery.retrying"]
+    debug = [rec for rec in records if rec.levelno == logging.DEBUG]
+    assert len(debug) == 1
+    assert "ConnectionError" in debug[0].getMessage()
+
+
+def test_send_timeout_logs_warning_without_debug_attempts(caplog):
+    r, a, slept = make(["timeout"])
+    with caplog.at_level(logging.DEBUG, logger="nuncio.delivery.retrying"):
+        assert r.send("title", "hello") is False
+    records = [rec for rec in caplog.records if rec.name == "nuncio.delivery.retrying"]
+    assert sum(1 for rec in records if rec.levelno == logging.DEBUG) == 0
+    assert any(rec.levelno == logging.WARNING and "SendTimeout" in rec.getMessage()
+               for rec in records)

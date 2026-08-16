@@ -15,6 +15,9 @@ The effective configuration (with every secret masked by Nuncio's own redactor) 
 | `NUNCIO_LLM_MODEL` | `default` | Model name/alias requested from `NUNCIO_LLM_URL`. |
 | `NUNCIO_LLM_TIMEOUT_S` | `10.0` | Per-attempt LLM call timeout, in seconds. |
 | `NUNCIO_LLM_MAX_TOKENS` | `400` | Cap on tokens requested from the LLM per enrichment. |
+| `NUNCIO_LLM_CB_FAILS` | `3` | Retryable LLM failures (5xx/429/transport) within the window that trip the enrichment circuit breaker. `0` disables the breaker. |
+| `NUNCIO_LLM_CB_WINDOW_S` | `300` | Sliding window (seconds) over which retryable LLM failures are counted. |
+| `NUNCIO_LLM_CB_COOLDOWN_S` | `60` | Time (seconds) the circuit stays open — enrichment fails fast to the raw fallback — before one half-open probe call decides recovery. |
 | `NUNCIO_LLM_HEADERS` | `{}` | Extra HTTP headers sent with every LLM request, as a JSON object string. |
 
 ## Knowledge plane (optional second LLM)
