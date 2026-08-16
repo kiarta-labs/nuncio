@@ -145,3 +145,56 @@ def test_thread_safety_smoke():
     for t in threads:
         t.join()
     assert not errors
+
+
+def test_trips_counts_threshold_trip():
+    clk = FakeClock()
+    cb = CircuitBreaker(fails=2, window_s=300, cooldown_s=60, clock=clk)
+    cb.record_failure()
+    assert cb.trips == 0
+    cb.record_failure()
+    assert cb.state == "open"
+    assert cb.trips == 1
+    cb.record_failure()  # defensive no-op while open
+    assert cb.trips == 1
+
+
+def test_trips_counts_half_open_reopen():
+    clk = FakeClock()
+    cb = CircuitBreaker(fails=2, window_s=300, cooldown_s=60, clock=clk)
+    cb.record_failure()
+    cb.record_failure()
+    clk.advance(61)
+    assert cb.allow()  # probe
+    cb.record_failure()  # probe failed -> re-opens
+    assert cb.state == "open"
+    assert cb.trips == 2
+    clk.advance(61)
+    assert cb.allow()
+    cb.record_success()  # probe succeeded -> closes, no new trip
+    assert cb.state == "closed"
+    assert cb.trips == 2
+
+
+def test_trips_not_counted_for_success_or_disabled_breaker():
+    clk = FakeClock()
+    cb = CircuitBreaker(fails=2, window_s=300, cooldown_s=60, clock=clk)
+    cb.record_failure()
+    cb.record_success()
+    cb.record_failure()
+    cb.record_success()
+    assert cb.trips == 0
+    off = CircuitBreaker(fails=0, window_s=300, cooldown_s=60, clock=clk)
+    for _ in range(10):
+        off.record_failure()
+    assert off.trips == 0
+
+
+def test_reconfigure_resets_trips():
+    clk = FakeClock()
+    cb = CircuitBreaker(fails=2, window_s=300, cooldown_s=60, clock=clk)
+    cb.record_failure()
+    cb.record_failure()
+    assert cb.trips == 1
+    cb.reconfigure(5, 600, 120)
+    assert cb.trips == 0

@@ -30,6 +30,11 @@ class CircuitBreaker:
         self._state = "closed"  # "closed" | "open" | "half_open"
         self._opened_at = None
         self._probe_in_flight = False
+        # Lifetime count of transitions into the open state (threshold trip +
+        # half-open probe failures). Monotonic per breaker instance; reset by
+        # `reconfigure`. Exposed to the metrics renderer as
+        # `nuncio_llm_breaker_trips_total`.
+        self.trips = 0
 
     # --- introspection -------------------------------------------------------
 
@@ -88,6 +93,7 @@ class CircuitBreaker:
                 self._state = "open"
                 self._opened_at = self._clock()
                 self._probe_in_flight = False
+                self.trips += 1
                 return
             if self._state == "open":
                 return  # defensive; allow() never admits calls while open
@@ -97,6 +103,7 @@ class CircuitBreaker:
             if len(self._failures) >= self.fails:
                 self._state = "open"
                 self._opened_at = now
+                self.trips += 1
 
     # --- live reconfiguration (settings screen) ------------------------------
 
@@ -109,3 +116,4 @@ class CircuitBreaker:
             self._state = "closed"
             self._opened_at = None
             self._probe_in_flight = False
+            self.trips = 0

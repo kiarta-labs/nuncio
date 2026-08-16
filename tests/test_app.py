@@ -759,6 +759,48 @@ def test_metrics_render_shape():
     assert "nuncio_assist_attempted_total 1" in text
     assert "nuncio_assist_ok_total 1" in text
     assert "nuncio_assist_failed_total 1" in text
+    # No breaker wired -> the breaker lines are simply absent.
+    assert "nuncio_llm_breaker" not in text
+
+
+def test_metrics_render_includes_breaker_lines_when_wired(tmp_path):
+    # App wires its engine's breaker into the metrics renderer: the live trip
+    # counter and the state gauges appear on /metrics.
+    from nuncio.engine import Engine
+    from nuncio.llm import LLMError
+
+    class FakeLLM:
+        model = "local-model"
+        _json_object_supported = None
+        def enrich(self, messages, max_tokens=400, response_format=None, timeout=None):
+            return "ok"
+
+    class FakeDelivery:
+        def send(self, envelope):
+            return True
+
+    store = Store(str(tmp_path / "a.db"))
+    eng = Engine(store=store, llm=FakeLLM(), delivery=FakeDelivery(),
+                 budget_s=45.0, per_attempt_s=20.0, delivery_budget_s=3.0,
+                 cb_fails=2, cb_window_s=300, cb_cooldown_s=60)
+    a = App(eng, store, Metrics(), budget_s=45.0, concurrency=0, queue_max=2,
+            clock=lambda: 1000.0, maint_interval=3600.0)
+    try:
+        assert a.metrics.breaker is eng.breaker
+        text = a.metrics.render()
+        assert "nuncio_llm_breaker_trips_total 0" in text
+        assert 'nuncio_llm_breaker_state{state="closed"} 1' in text
+        assert 'nuncio_llm_breaker_state{state="half_open"} 0' in text
+        assert 'nuncio_llm_breaker_state{state="open"} 0' in text
+        # Trip the breaker through the engine: render reflects it live.
+        eng.breaker.record_failure()
+        eng.breaker.record_failure()
+        assert eng.breaker.state == "open"
+        text = a.metrics.render()
+        assert "nuncio_llm_breaker_trips_total 1" in text
+        assert 'nuncio_llm_breaker_state{state="open"} 1' in text
+    finally:
+        store.close()
 
 
 def test_ingest_survives_adapter_parse_exception(app, monkeypatch):
