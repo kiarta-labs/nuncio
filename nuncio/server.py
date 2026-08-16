@@ -93,6 +93,10 @@ class Metrics:
         # distinguishes "LLM endpoint hung past its bound" from a plain
         # transport failure). The raw fallback watchdog.
         self.llm_abandoned = 0
+        # Live reference to the engine's LLM circuit breaker (wired by App).
+        # When set, the renderer emits its trip counter and state as gauges;
+        # None (hand-built Metrics in tests) just omits the lines.
+        self.breaker = None
 
     def inc(self, attr, key=None, n=1):
         with self._lock:
@@ -122,6 +126,11 @@ class Metrics:
             lines.append(f"nuncio_assist_failed_total {self.assist_failed}")
             lines.append(f"nuncio_purged_stale_received_total {self.purged_stale_received}")
             lines.append(f"nuncio_llm_abandoned_total {self.llm_abandoned}")
+            if self.breaker is not None:
+                lines.append(f"nuncio_llm_breaker_trips_total {self.breaker.trips}")
+                for st in ("closed", "half_open", "open"):
+                    on = 1 if self.breaker.state == st else 0
+                    lines.append(f'nuncio_llm_breaker_state{{state="{st}"}} {on}')
         return "\n".join(lines) + "\n"
 
 
@@ -147,6 +156,10 @@ class App:
         self.engine = engine
         self.store = store
         self.metrics = metrics
+        # Wire the breaker into the metrics renderer (live state/trips gauge
+        # on /metrics). Guarded so a fake Metrics in tests stays untouched.
+        if self.metrics is not None and hasattr(self.metrics, "breaker"):
+            self.metrics.breaker = getattr(engine, "breaker", None)
         self.budget_s = budget_s
         self.full_budget_s = full_budget_s
         self.clock = clock

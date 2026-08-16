@@ -76,6 +76,7 @@ def test_retryable_failures_trip_circuit_and_next_alert_fails_fast(store):
     out = eng.process("k1", ALERT, RAW)
     assert out == "raw"
     assert eng.breaker.state == "open"
+    assert eng.breaker.trips == 1
     # Next alert: the circuit is open -> zero LLM calls, and the fail-safe
     # invariant still holds (raw + marker, store marked delivered_raw).
     store.persist("k2", RAW)
@@ -83,6 +84,7 @@ def test_retryable_failures_trip_circuit_and_next_alert_fails_fast(store):
     out2 = eng.process("k2", ALERT, RAW)
     assert out2 == "raw"
     assert len(llm.calls) == 0
+    assert eng.breaker.trips == 1  # allow()-denials are not trips
     assert store.get_status("k2") == "delivered_raw"
     assert dlv.sent[1].detail.startswith(RAW_FALLBACK_MARKER)
 
