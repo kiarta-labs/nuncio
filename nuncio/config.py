@@ -65,6 +65,9 @@ _SCHEMA = {
     "NUNCIO_LLM_MODEL": ("default", str),
     "NUNCIO_LLM_TIMEOUT_S": (10.0, float),
     "NUNCIO_LLM_MAX_TOKENS": (400, int),
+    "NUNCIO_LLM_CB_FAILS": (3, int),
+    "NUNCIO_LLM_CB_WINDOW_S": (300, int),
+    "NUNCIO_LLM_CB_COOLDOWN_S": (60, int),
     "NUNCIO_LLM_HEADERS": ("{}", str),
     "NUNCIO_ENRICH_FORMAT": ("auto", str),
     "NUNCIO_KNOWLEDGE_ENABLED": ("true", str),
@@ -199,6 +202,17 @@ UI_EDITABLE = {
                                   help="Must not exceed the overall alert budget."),
     "NUNCIO_LLM_MAX_TOKENS": _spec("NUNCIO_LLM_MAX_TOKENS", category="live", type="int", min=16, max=4096,
                                    group="llm", label="Max completion tokens"),
+    "NUNCIO_LLM_CB_FAILS": _spec("NUNCIO_LLM_CB_FAILS", category="live", type="int", min=0, max=100,
+                                 group="llm", label="Circuit-breaker failures",
+                                 help="Retryable LLM failures (5xx/429/transport) within the window "
+                                      "that trip the enrichment circuit breaker; 0 disables it."),
+    "NUNCIO_LLM_CB_WINDOW_S": _spec("NUNCIO_LLM_CB_WINDOW_S", category="live", type="int", min=10, max=86400,
+                                    group="llm", label="Circuit-breaker window (s)",
+                                    help="Sliding window over which retryable LLM failures are counted."),
+    "NUNCIO_LLM_CB_COOLDOWN_S": _spec("NUNCIO_LLM_CB_COOLDOWN_S", category="live", type="int", min=1, max=86400,
+                                      group="llm", label="Circuit-breaker cooldown (s)",
+                                      help="Time the circuit stays open (enrichment fails fast to raw) "
+                                           "before one half-open probe call is allowed."),
 
     # --- Knowledge plane: on/off + alias only; the endpoint is a NEVER-key.
     # Enabled by default (Phase C) -- inherits the enrichment (private) plane's
@@ -1171,6 +1185,13 @@ def apply_changes(app, set_map, reset_list=None):
             set_allow_keywords(candidate.NUNCIO_REDACT_ALLOW_KEYWORDS)
         if "NUNCIO_LLM_TIMEOUT_S" in live_changed:
             engine.per_attempt_s = candidate.NUNCIO_LLM_TIMEOUT_S
+        if any(k in live_changed for k in
+               ("NUNCIO_LLM_CB_FAILS", "NUNCIO_LLM_CB_WINDOW_S", "NUNCIO_LLM_CB_COOLDOWN_S")):
+            engine.breaker.reconfigure(
+                candidate.NUNCIO_LLM_CB_FAILS,
+                candidate.NUNCIO_LLM_CB_WINDOW_S,
+                candidate.NUNCIO_LLM_CB_COOLDOWN_S,
+            )
         if "NUNCIO_MODE" in live_changed:
             engine.mode = candidate.NUNCIO_MODE
         if "NUNCIO_ENRICH_FORMAT" in live_changed:
@@ -1677,6 +1698,8 @@ def build_app(settings=None, clock=None):
     engine = Engine(
         store, llm, delivery, gatherer=gatherer,
         budget_s=settings.NUNCIO_BUDGET_S, per_attempt_s=settings.NUNCIO_LLM_TIMEOUT_S,
+        cb_fails=settings.NUNCIO_LLM_CB_FAILS, cb_window_s=settings.NUNCIO_LLM_CB_WINDOW_S,
+        cb_cooldown_s=settings.NUNCIO_LLM_CB_COOLDOWN_S,
         mode=settings.NUNCIO_MODE,
         clock=clock,
         router=router, knowledge_llm=knowledge_llm,
