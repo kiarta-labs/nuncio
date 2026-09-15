@@ -87,8 +87,18 @@ def build_settings_json(app):
         for name, reason in _cfg().NEVER_REASONS.items():
             value = getattr(settings, name, "")
             secret = name in secret_keys
+            if name == "NUNCIO_PROVIDERS_JSON":
+                # Registry blob is structurally masked (ids, redacted URLs,
+                # ref NAMES, key presence) -- the raw JSON may carry entry
+                # headers (documented as potentially credential-bearing), and
+                # this endpoint is unauthenticated. Same view /config.json
+                # and /providers.json emit.
+                value = _cfg()._masked_providers_view(settings)
+                masked_value = value
+            else:
+                masked_value = _mask(value) if secret else _redacted(value)
             keys[name] = {
-                "value": _mask(value) if secret else _redacted(value),
+                "value": masked_value,
                 "source": settings.source.get(name, "env" if value else "default"),
                 "default": _cfg()._SCHEMA.get(name, (None, None))[0],
                 "editable": False,
@@ -298,6 +308,7 @@ const STAGES = ['intake', 'context', 'enrich', 'deliver', 'global'];
 
 const STAGE_SUBSECTIONS = {
   enrich: [
+    ['Providers', ['providers']],
     ['Model', ['llm', 'pipeline']],
     ['Knowledge', ['knowledge']],
     ['After delivery (assist)', ['assist']],
@@ -329,6 +340,7 @@ const NEVER_GROUP = {
   NUNCIO_KNOWLEDGE_URL: 'knowledge', NUNCIO_KNOWLEDGE_KEY: 'knowledge',
   NUNCIO_ASSIST_URL: 'assist', NUNCIO_ASSIST_KEY: 'assist',
   NUNCIO_ASSIST_DATA_POSTURE: 'assist', NUNCIO_ASSIST_CONFIRM_EXTERNAL_OK: 'assist',
+  NUNCIO_PROVIDERS_JSON: 'providers',
   NUNCIO_EXTRA_SOURCES: 'ingest',
   NUNCIO_REDACT_EXTRA: 'redaction',
   NUNCIO_DATA_DIR: 'env-boot', NUNCIO_CONFIG: 'env-boot', NUNCIO_ADMIN_TOKEN: 'env-boot',
@@ -336,6 +348,7 @@ const NEVER_GROUP = {
 
 let STATS = null;
 let SOURCES = null;
+let PROVIDERS = null;
 let RESTART_PENDING = [];
 let OPEN_STAGE = null;
 let INITIALIZED = false;
@@ -356,6 +369,7 @@ function renderStage(key) {
   const keys = stageKeys(key);
   let html = '';
   if (key === 'intake') html += '<div id="intake-inv" class="muted">Loading adapters&hellip;</div>';
+  if (key === 'enrich') html += '<div id="providers-inv" class="muted">Loading providers&hellip;</div>';
   const subs = STAGE_SUBSECTIONS[key];
   if (subs) {
     const used = {};
@@ -388,6 +402,7 @@ function renderStage(key) {
     else el.value = KEYS[k].type === 'json' ? JSON.stringify(DIRTY[k]) : DIRTY[k];
   });
   if (key === 'intake') loadSources();
+  if (key === 'enrich') loadProviders();
 }
 
 async function loadSources() {
@@ -436,7 +451,73 @@ function upgradeDefaultSourceSelect(registered, current) {
   select.addEventListener('change', () => onEdit('NUNCIO_DEFAULT_SOURCE', select.value));
   input.replaceWith(select);
 }
+""" + _minify_lock_js(r"""
+const PROVIDER_SELECTOR_KEYS = ['NUNCIO_LLM_PROVIDER', 'NUNCIO_KNOWLEDGE_PROVIDER', 'NUNCIO_ASSIST_PROVIDER'];
 
+async function loadProviders() {
+  // Provider inventory + per-plane selector upgrades + live test buttons.
+  // Only REGISTRY entries are selectable (legacy installs show the seeded
+  // pseudo-entries as read-only inventory with a legacy badge -- selecting
+  // one would fail validation, so they are deliberately not offered).
+  try {
+    const list = PROVIDERS || [];
+    const selectable = list.filter(p => p.source === 'registry').map(p => p.id);
+    const inv = document.getElementById('providers-inv');
+    if (inv) {
+      const rows = list.map(p =>
+        '<div class="row"><div class="lbl">' + esc(p.id) +
+        (p.source === 'legacy' ? ' <span class="badge-src default">legacy</span>' : '') + '</div>' +
+        '<div class="muted">' + esc(p.model || '(no model)') + ' · key ' +
+        (p.key === '«set»' ? 'set' : 'unset') + '</div>' +
+        '<div><button class="btn" data-provider-test="' + esc(p.id) + '">Test</button> ' +
+        '<span class="muted" data-provider-result="' + esc(p.id) + '"></span></div><div></div></div>'
+      ).join('');
+      inv.outerHTML = rows || '<p class="muted">No providers configured.</p>';
+      document.querySelectorAll('[data-provider-test]').forEach(btn => {
+        btn.addEventListener('click', () => testProvider(btn.getAttribute('data-provider-test')));
+      });
+    }
+    upgradeProviderSelects(selectable);
+  } catch (e) { /* leave the placeholder and the plain text selector inputs in place */ }
+}
+
+function upgradeProviderSelects(ids) {
+  PROVIDER_SELECTOR_KEYS.forEach(k => {
+    const input = document.querySelector('[data-k="' + k + '"]');
+    if (!input || input.tagName === 'SELECT') return;
+    // Seed from a pending typed edit first (same async-upgrade race as
+    // upgradeDefaultSourceSelect above -- never overwrite an unapplied edit).
+    const current = DIRTY.hasOwnProperty(k) ? DIRTY[k] : ((KEYS[k] && KEYS[k].value) || '');
+    const select = document.createElement('select');
+    select.setAttribute('data-k', k);
+    select.disabled = !(ADMIN_TOKEN_CONFIGURED && TOKEN);
+    const opts = [{v: '', label: 'legacy (env trio)'}]
+      .concat(ids.map(id => ({v: id, label: id})));
+    // Keep a pending/unknown value visible rather than dropping it.
+    if (current && opts.every(o => o.v !== current)) opts.push({v: current, label: current + ' (unknown)'});
+    select.innerHTML = opts.map(o =>
+      '<option value="' + esc(o.v) + '"' + (o.v === current ? ' selected' : '') + '>' + esc(o.label) + '</option>'
+    ).join('');
+    select.addEventListener('change', () => onEdit(k, select.value));
+    input.replaceWith(select);
+  });
+}
+
+async function testProvider(id) {
+  const slot = document.querySelector('[data-provider-result="' + id + '"]');
+  if (slot) slot.textContent = 'probing…';
+  try {
+    const r = await fetch('/providers/' + encodeURIComponent(id) + '/test',
+      { headers: { 'X-Admin-Token': TOKEN } });
+    const data = await r.json();
+    if (slot) slot.textContent = data.ok
+      ? ('ok · ' + data.latency_ms + 'ms · ' + (data.echo || ''))
+      : ('FAILED · ' + (data.error || r.status));
+  } catch (e) {
+    if (slot) slot.textContent = 'request failed';
+  }
+}
+""") + r"""
 // Phase E/F: world-column fan-in/fan-out. Labels are HTML <span>s, not SVG
 // <text> (SVG text stretched under the non-uniform viewBox scale).
 """ + _minify_lock_js(r"""
@@ -969,6 +1050,12 @@ async function load() {
         const rsrc = await fetch('/sources');
         SOURCES = await rsrc.json();
       } catch (e) { SOURCES = null; }
+    }
+    if (!PROVIDERS) {
+      try {
+        const rprov = await fetch('/providers.json');
+        PROVIDERS = await rprov.json();
+      } catch (e) { PROVIDERS = null; }
     }
     renderBanners(data);
     renderLock();

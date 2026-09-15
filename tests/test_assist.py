@@ -380,7 +380,7 @@ def test_queue_full_delivers_full_immediately_and_marks_skipped(store):
         def eligible(self, severity, mode):
             return mode == "enriched" and severity == "critical"
 
-        def submit(self, key, envelope, context_text, followup=False):
+        def submit(self, key, envelope, context_text, followup=False, trusted=False):
             return False
 
     eng = make_engine(store, llm, dispatch, FakeClock(), assist=AlwaysFullTrack())
@@ -592,7 +592,7 @@ class _AlwaysFullTrack:
     def eligible(self, severity, mode):
         return mode == "enriched" and severity == "critical"
 
-    def submit(self, key, envelope, context_text, followup=False):
+    def submit(self, key, envelope, context_text, followup=False, trusted=False):
         return False
 
 

@@ -263,3 +263,59 @@ def test_build_envelope_evidence_appendix_capped():
     idx = env.detail.find("--- Evidence:")
     appendix = env.detail[idx:]
     assert len(appendix.encode("utf-8")) <= 1000 + 200  # min(4000//4, 8000) + slack
+
+
+# --- S-track: best_display_name + headline entity override + detail header ---
+
+def test_best_display_name_host_and_service():
+    from nuncio.envelope import best_display_name
+    assert best_display_name({"host": "host01", "service": "db"}) == "host01/db"
+
+
+def test_best_display_name_skips_placeholder_host():
+    from nuncio.envelope import best_display_name
+    assert best_display_name({"host": "-", "service": "db"}) == "db"
+    assert best_display_name({"host": "", "service": "db"}) == "db"
+    assert best_display_name({"host": None, "service": "db"}) == "db"
+
+
+def test_best_display_name_falls_back_to_source_then_category():
+    from nuncio.envelope import best_display_name
+    assert best_display_name({"source": "grafana"}) == "grafana"
+    assert best_display_name({"source": "grafana", "category": "network"}) == "grafana network"
+    assert best_display_name({}) == "alert"
+    assert best_display_name(None) == "alert"
+    assert best_display_name({"host": "-", "service": ""}) == "alert"
+
+
+def test_best_display_name_never_raises_on_garbage():
+    from nuncio.envelope import best_display_name
+    assert best_display_name({"host": 123, "service": ["x"]}) != ""
+    assert best_display_name("not a dict") == "alert"
+
+
+def test_headline_entity_override_replaces_composition():
+    h = build_headline("critical", "-", "db", "down", entity="grafana network")
+    assert h.startswith("❗ grafana network — ")
+
+
+def test_headline_entity_override_absent_keeps_legacy():
+    h = build_headline("critical", "host01", "db", "down")
+    assert "host01/db" in h
+
+
+def test_build_envelope_header_block_prepends_detail_not_summary():
+    from nuncio.render import build_envelope
+    env = build_envelope(
+        "the finding", "raw alert text", severity="critical", host="h", service="s",
+        entity="h/s", header="Severity: Critical\nAffected: h/s",
+    )
+    assert env.summary == "the finding"  # terse legs still read the issue first line
+    assert env.detail.startswith("Severity: Critical\nAffected: h/s\n\nthe finding")
+    assert "h/s — the finding" in env.headline
+
+
+def test_build_envelope_without_header_unchanged():
+    from nuncio.render import build_envelope
+    env = build_envelope("the finding", "raw alert text", severity="critical", host="h", service="s")
+    assert env.detail.startswith("the finding\n\n--- Raw alert:")

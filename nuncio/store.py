@@ -102,6 +102,21 @@ class Store:
         # migration loop above so the column it indexes is guaranteed to exist
         # (a fresh CREATE TABLE doesn't include it; only the loop adds it).
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_fp ON alerts(fingerprint)")
+        # C6: feedback/oversight table -- operator split/merge/confirm-root
+        # actions recorded for auditing and for bounded rank corrections (see
+        # record_feedback / feedback_corrections). Ingest-independent.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS feedback ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  key TEXT NOT NULL,"
+            "  action TEXT NOT NULL,"
+            "  ref_key TEXT,"
+            "  created_at REAL NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_dedup "
+            "ON feedback(key, action, COALESCE(ref_key, ''))"
+        )
         # Historical-mode migration: a DB file from before the delivery-mode
         # collapse (see mark_delivered's docstring) may still have rows stuck
         # in the old interim 'delivered_raw_pending_enrich' status -- that
@@ -279,6 +294,139 @@ class Store:
         first_seen = row[1] if row and row[1] is not None else None
         return count, first_seen
 
+    def service_day_rows(self, since, limit=20000):
+        """[(service, severity, created_at, fingerprint)] for rows created at
+        or after `since` (epoch), newest first, bounded by `limit` -- the
+        input to nuncio.topology's learned-edge computation. Severity
+        filtering happens in the caller (this stays a dumb bounded scan).
+        Never raises (returns []), like every other read path here."""
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT service, severity, created_at, fingerprint FROM alerts "
+                    "WHERE created_at >= ? AND key NOT LIKE ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (since, CANARY_PREFIX + "%", max(1, int(limit))),
+                ).fetchall()
+            return [(s, sev, ts, fp) for s, sev, ts, fp in rows]
+        except Exception:
+            return []
+
+    # --- C6 feedback / oversight --------------------------------------------
+
+    _FEEDBACK_ACTIONS = frozenset(("confirm_root", "split", "merge"))
+
+    def record_feedback(self, key, action, ref_key=None, now=None):
+        """Record one operator feedback action on an alert. `key`/`ref_key`
+        must reference persisted alert keys (both are resolved to their
+        subject services for pair corrections -- a nonexistent key is
+        refused, so a typo can never silently no-op). `action` in
+        {confirm_root, split, merge}; a duplicate (same key+action+ref)
+        is a no-op returning False. Never raises (returns False on any
+        failure -- feedback is oversight, never a delivery dependency)."""
+        try:
+            if action not in self._FEEDBACK_ACTIONS:
+                return False
+            now = self._clock() if now is None else now
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT 1 FROM alerts WHERE key = ?", (key,)).fetchone()
+                if row is None:
+                    return False
+                if ref_key is not None:
+                    rrow = self._conn.execute(
+                        "SELECT 1 FROM alerts WHERE key = ?", (ref_key,)).fetchone()
+                    if rrow is None:
+                        return False
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO feedback (key, action, ref_key, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (key, action, ref_key, now),
+                )
+                self._conn.commit()
+                return cur.rowcount == 1
+        except Exception:
+            return False
+
+    def feedback_summary(self):
+        """{"total": n, "by_action": {...}} -- dashboard transparency. Never
+        raises (zeros on failure)."""
+        try:
+            with self._lock:
+                total = self._conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+                rows = self._conn.execute(
+                    "SELECT action, COUNT(*) FROM feedback GROUP BY action").fetchall()
+            return {"total": int(total or 0),
+                    "by_action": {a: int(n) for a, n in rows}}
+        except Exception:
+            return {"total": 0, "by_action": {}}
+
+    def feedback_corrections(self, now=None):
+        """{(service_a, service_b): signed_bump} for correlation ranking.
+        `split` action on (key, ref_key) votes AGAINST those two subjects
+        co-ranking; `merge` votes FOR; `confirm_root` records a single
+        alert's importance but defines no pair. Bounded guardrails: each
+        pair's net bump is clamped to ±1.0 (a hundred split clicks can't
+        override the causal gate -- this is a tiebreaker within gated rows,
+        applied by rank_correlated's `corrections` param), and pairs only
+        exist where both subjects have a real service. Returns {} on any
+        failure (feedback is best-effort by construction)."""
+        try:
+            cutoff = (self._clock() if now is None else now) - 180 * 86400
+            pairs = {}
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT f.action, a.service, r.service "
+                    "FROM feedback f "
+                    "JOIN alerts a ON a.key = f.key "
+                    "JOIN alerts r ON r.key = f.ref_key "
+                    "WHERE f.created_at >= ? AND f.ref_key IS NOT NULL "
+                    "AND f.action IN ('split', 'merge')",
+                    (cutoff,)).fetchall()
+                for action, a_svc, r_svc in rows:
+                    sa = _norm_feedback_service(a_svc)
+                    sb = _norm_feedback_service(r_svc)
+                    if not sa or not sb or sa == sb:
+                        continue
+                    pair = tuple(sorted((sa, sb)))
+                    inc = 1.0 if action == "merge" else -1.0
+                    pairs[pair] = min(1.0, max(-1.0, pairs.get(pair, 0.0) + inc))
+            return pairs
+        except Exception:
+            return {}
+
+
+    def past_incidents(self, fp, limit=3, now=None):
+        """C5: previously-RESOLVED instances of this fingerprint, newest
+        first, bounded -- the RAG source for "## Similar past incidents".
+        Returns [(created_at, status, enrichment_first_line, payload_first_line)].
+        Only terminal delivered rows (enriched/raw) qualify (a never-finished
+        'received' row is not a past incident); `enrichment`/`payload` are
+        already-redacted at rest (rule 1), so this is safe for both trust
+        tiers. Never raises (returns [])."""
+        try:
+            limit = max(1, min(int(limit or 3), 10))
+            now = self._clock() if now is None else now
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT created_at, status, enrichment, payload FROM alerts "
+                    "WHERE fingerprint = ? AND status LIKE 'delivered_%' "
+                    "AND key NOT LIKE ? AND created_at < ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (fp, CANARY_PREFIX + "%", now, limit),
+                ).fetchall()
+            out = []
+            for created, status, enrichment, payload in rows:
+                enrich = (enrichment or "").strip()
+                pay = (payload or "").strip()
+                first = next((ln.strip() for ln in enrich.splitlines() if ln.strip()), None)
+                if first is None:
+                    first = next((ln.strip() for ln in pay.splitlines() if ln.strip()), "") or "(no detail)"
+                out.append((created, status or "delivered", first[:200], pay[:160]))
+            return out
+        except Exception:
+            return []
+
     def fingerprint_deliveries(self, fp, window_s, now=None):
         """(created_at, severity) for DELIVERED rows sharing fingerprint
         `fp` within the backward window `[now-window_s, now]`, oldest
@@ -407,6 +555,24 @@ class Store:
     # status == 'received').
     _MARK_MODES = ("enriched", "raw", "suppressed_flap")
 
+    def mark_digested(self, key):
+        """Fold one alert into its digest window: status -> 'delivered_digested'.
+
+        Terminal and auditable like 'suppressed_flap' (never delivered
+        individually, invisible to undelivered_older_than which only selects
+        status == 'received', reaped by purge_delivered's LIKE 'delivered_%').
+        CAS from 'received' only -- returns False when the row already moved
+        on (maintenance/worker won the race), in which case the caller must
+        fall through to the normal path rather than silently dropping it."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE alerts SET status = 'delivered_digested' "
+                "WHERE key = ? AND status = 'received'",
+                (key,),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
     def mark_delivered(self, key, mode):
         """mode in _MARK_MODES -> status delivered_<mode>."""
         if mode not in self._MARK_MODES:
@@ -508,3 +674,15 @@ class Store:
     def close(self):
         with self._lock:
             self._conn.close()
+
+
+def _norm_feedback_service(value):
+    """Placeholder-guarded lowercase service identity for feedback pairs
+    (same posture as correlate._norm)."""
+    try:
+        v = str(value or "").strip()
+    except Exception:
+        return None
+    if v and v != "-" and any(c.isalnum() for c in v):
+        return v.lower()
+    return None

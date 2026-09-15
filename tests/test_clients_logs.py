@@ -404,3 +404,40 @@ def test_dotted_host_still_queries():
     src = _selector_regex_source(host)
     assert src == ".*" + re.escape(host) + ".*"
     assert re.fullmatch(src, host)
+
+
+def test_openobserve_placeholder_host_is_treated_as_missing():
+    # Q3: "-" (and other non-hosts) must not add a str_match(field,'-')
+    # clause matching nearly every line -- the query runs on the unit
+    # clause alone, exactly like a genuinely missing host.
+    captured = {}
+
+    def fake_transport(method, url, headers=None, payload=None, timeout=None, max_bytes=None):
+        captured["sql"] = payload["query"]["sql"]
+        return {"hits": []}
+
+    client = OpenObserveClient("http://o2:5080/api/default", transport=fake_transport)
+    for placeholder in ("-", "", "!!!"):
+        captured.clear()
+        assert client.query(placeholder, "sonarr") == []
+        assert "'-'" not in captured["sql"]
+        assert "str_match_ignore_case(message, 'sonarr')" in captured["sql"]
+    # a real host still produces its clause
+    captured.clear()
+    client.query("web-1", "sonarr")
+    assert "str_match_ignore_case(message, 'web-1')" in captured["sql"]
+
+
+def test_loki_placeholder_host_behaves_like_missing_host():
+    # Q3: "-" must hit the same no-host early return as None -- the Loki
+    # stream selector requires a real host, and ".*-.*" matches everything.
+    calls = []
+
+    def fake_transport(*a, **kw):
+        calls.append(1)
+        return {"data": {"result": []}}
+
+    client = LokiClient("http://loki:3100", transport=fake_transport)
+    assert client.query("-") == []
+    assert client.query("-  ") == []
+    assert calls == []

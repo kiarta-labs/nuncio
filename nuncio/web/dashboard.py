@@ -532,6 +532,8 @@ def build_stats(app, now=None):
     planes = {
         "private": {
             "model": private_cfg.get("model"),
+            "provider": private_cfg.get("provider"),
+            "trusted": bool(private_cfg.get("trusted")),
             "calls_24h": sum(1 for r in rows_24h if r["llm_ms"] is not None),
             "errors_24h": sum(1 for r in rows_24h if r.get("fail_stage") in ("llm", "validate")),
             "p95_ms": percentile(llm_latencies, 0.95),
@@ -931,7 +933,9 @@ function render(s, alerts) {
 
   const stripBits = [];
   const pv = s.planes.private;
-  stripBits.push(pill('private: ' + (pv.model || 'unset'), pv.model ? 'enriched' : 'off'));
+  const pvProv = (pv.provider) || '';
+  const pvTrust = pv.trusted ? ' (trusted)' : '';
+  stripBits.push(pill('private: ' + (pv.model || 'unset') + (pvProv ? '@' + pvProv : '') + pvTrust, pv.model ? 'enriched' : 'off'));
   stripBits.push(pill('knowledge: ' + (s.planes.knowledge.enabled ? (s.planes.knowledge.model || 'on') : 'off'),
                        s.planes.knowledge.enabled ? 'enriched' : 'off'));
   (s.delivery.adapters.length ? s.delivery.adapters : ['none']).forEach(a =>

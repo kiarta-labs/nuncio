@@ -1072,6 +1072,7 @@ def test_ui_editable_table_has_no_overlap_with_never_reasons():
 def test_never_reasons_covers_the_documented_security_perimeter():
     expected = {
         "NUNCIO_LLM_URL", "NUNCIO_LLM_KEY", "NUNCIO_LLM_HEADERS",
+        "NUNCIO_PROVIDERS_JSON",
         "NUNCIO_KNOWLEDGE_URL", "NUNCIO_KNOWLEDGE_KEY",
         "NUNCIO_ASSIST_URL", "NUNCIO_ASSIST_KEY",
         "NUNCIO_ASSIST_DATA_POSTURE", "NUNCIO_ASSIST_CONFIRM_EXTERNAL_OK",
@@ -1914,6 +1915,7 @@ def test_stage_for_ui_editable_spot_checks(name, expected):
     ("NUNCIO_LLM_URL", "enrich"),
     ("NUNCIO_LLM_KEY", "enrich"),
     ("NUNCIO_LLM_HEADERS", "enrich"),
+    ("NUNCIO_PROVIDERS_JSON", "enrich"),
     ("NUNCIO_KNOWLEDGE_URL", "enrich"),
     ("NUNCIO_KNOWLEDGE_KEY", "enrich"),
     ("NUNCIO_ASSIST_URL", "enrich"),
@@ -1928,3 +1930,277 @@ def test_stage_for_ui_editable_spot_checks(name, expected):
 ])
 def test_stage_for_never_keys_spot_checks(name, expected):
     assert config.stage_for(name, None) == expected
+
+
+# =====================================================================
+# P0: provider registry (NUNCIO_PROVIDERS_JSON + per-plane selectors)
+# =====================================================================
+
+def _registry_env(**overrides):
+    env = base_env()
+    env.update(overrides)
+    return env
+
+
+def test_empty_registry_resolves_to_legacy_trio_verbatim():
+    s = config.load_settings(_registry_env())
+    assert s.provider_registry == {}
+    assert (s.private_url, s.private_key, s.private_model,
+            s.private_timeout_s, s.private_headers) == (
+        s.NUNCIO_LLM_URL, s.NUNCIO_LLM_KEY, s.NUNCIO_LLM_MODEL,
+        s.NUNCIO_LLM_TIMEOUT_S, s.llm_headers)
+    # knowledge inheritance untouched
+    assert s.knowledge_url == s.NUNCIO_LLM_URL
+    assert s.assist_url == s.NUNCIO_ASSIST_URL
+
+
+def test_registry_entry_resolves_with_legacy_fallbacks():
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps({
+            "main": {"base_url": "http://llm:11434/v1", "model": "m1",
+                     "timeout_s": 20.0, "headers": {"X-Tenant": "t"}}}),
+        NUNCIO_LLM_PROVIDER="main",
+    )
+    s = config.load_settings(env)
+    assert (s.private_url, s.private_key, s.private_model,
+            s.private_timeout_s, s.private_headers) == (
+        "http://llm:11434/v1", "", "m1", 20.0, {"X-Tenant": "t"})
+
+
+def test_registry_entry_falls_back_per_field():
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps({"main": {"base_url": "http://llm:11434/v1"}}),
+        NUNCIO_LLM_PROVIDER="main",
+        NUNCIO_LLM_MODEL="legacy-model",
+    )
+    s = config.load_settings(env)
+    assert s.private_url == "http://llm:11434/v1"
+    assert s.private_model == "legacy-model"  # entry left model empty
+    assert s.private_timeout_s == s.NUNCIO_LLM_TIMEOUT_S
+
+
+def test_registry_unknown_selector_is_fatal():
+    with pytest.raises(config.ConfigError):
+        config.load_settings(_registry_env(NUNCIO_LLM_PROVIDER="ghost"))
+
+
+def test_registry_rejects_malformed_blobs():
+    bad = [
+        "{not json",
+        "[1, 2]",
+        json.dumps({"x" * 65: {"base_url": "http://h/v1"}}),  # bad id
+        json.dumps({"ok": {"base_url": "http://h/v1", "bogus": 1}}),  # unknown field
+        json.dumps({"ok": {}}),  # missing base_url
+        json.dumps({"ok": {"base_url": "ftp://h/x"}}),  # bad scheme
+        json.dumps({"ok": {"base_url": "http://h/v1", "timeout_s": "soon"}}),
+        json.dumps({"ok": {"base_url": "http://h/v1", "timeout_s": -1}}),
+        json.dumps({"ok": {"base_url": "http://h/v1", "headers": "x"}}),
+        json.dumps({"ok": {"base_url": "http://h/v1", "api_key_ref": "lowercase-nope"}}),
+        json.dumps({"ok": {"base_url": "http://h/v1", "trusted": "yes"}}),  # must be a real bool
+        json.dumps({f"p{i}": {"base_url": "http://h/v1"} for i in range(17)}),  # cap is 16
+    ]
+    for raw in bad:
+        with pytest.raises(config.ConfigError):
+            config.load_settings(_registry_env(NUNCIO_PROVIDERS_JSON=raw))
+
+
+def test_registry_trusted_true_boots_with_remote_warning(caplog):
+    # P1: trusted is allowed; a non-local trusted endpoint gets a loud
+    # startup warning naming the provider (explicit choice, never accident).
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps({"ok": {"base_url": "http://h/v1", "trusted": True}}),
+    )
+    with caplog.at_level("WARNING", logger="nuncio.config"):
+        s = config.load_settings(env)
+    assert s.provider_registry["ok"]["trusted"] is True
+    assert s.private_trusted is False  # no selector -> legacy private plane
+    assert any("flagged trusted" in rec.message for rec in caplog.records)
+
+
+def test_registry_trusted_local_endpoint_no_warning(caplog):
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps(
+            {"local": {"base_url": "http://127.0.0.1:11434/v1", "trusted": True}}),
+        NUNCIO_LLM_PROVIDER="local",
+    )
+    with caplog.at_level("WARNING", logger="nuncio.config"):
+        s = config.load_settings(env)
+    assert s.private_trusted is True
+    assert not any("flagged trusted" in rec.message for rec in caplog.records)
+
+
+def test_registry_api_key_ref_resolves_from_env_only():
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps(
+            {"ext": {"base_url": "https://llm.example.com/v1", "api_key_ref": "EXT_LLM_KEY"}}),
+        NUNCIO_LLM_PROVIDER="ext",
+        EXT_LLM_KEY="canary-secret-value",
+    )
+    s = config.load_settings(env)
+    assert s.private_key == "canary-secret-value"
+    assert s.provider_secrets == {"ext": "canary-secret-value"}
+    # the secret is in memory only: never in as_dict, overrides, or masks
+    assert "canary-secret-value" not in json.dumps(s.as_dict())
+    assert "canary-secret-value" not in json.dumps(config.masked_config_dict(s))
+    assert "canary-secret-value" not in json.dumps(config.providers_list_view(s))
+
+
+def test_registry_missing_ref_against_remote_endpoint_is_fatal():
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps(
+            {"ext": {"base_url": "https://llm.example.com/v1", "api_key_ref": "MISSING_KEY"}}),
+        NUNCIO_LLM_PROVIDER="ext",
+    )
+    with pytest.raises(config.ConfigError):
+        config.load_settings(env)
+
+
+def test_registry_missing_ref_against_local_endpoint_warns_and_continues(caplog):
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps(
+            {"local": {"base_url": "http://127.0.0.1:11434/v1", "api_key_ref": "MISSING_KEY"}}),
+        NUNCIO_LLM_PROVIDER="local",
+    )
+    s = config.load_settings(env)
+    assert s.private_key == ""
+    assert any("api_key_ref" in rec.message for rec in caplog.records)
+
+
+def test_registry_dns_name_counts_as_remote_for_missing_ref():
+    # A resolvable-looking DNS name could point anywhere -- fail closed.
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps(
+            {"svc": {"base_url": "http://gateway:4000/v1", "api_key_ref": "MISSING_KEY"}}),
+        NUNCIO_LLM_PROVIDER="svc",
+    )
+    with pytest.raises(config.ConfigError):
+        config.load_settings(env)
+
+
+def test_knowledge_selector_resolves_entry_and_model_fallback():
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps({"kg": {"base_url": "http://kg:11434/v1"}}),
+        NUNCIO_KNOWLEDGE_PROVIDER="kg",
+    )
+    s = config.load_settings(env)
+    assert s.knowledge_url == "http://kg:11434/v1"
+    assert s.knowledge_model == s.private_model  # entry left model empty
+
+
+def test_assist_selector_resolves_entry():
+    env = _registry_env(
+        NUNCIO_ASSIST_ENABLED="true",
+        NUNCIO_PROVIDERS_JSON=json.dumps(
+            {"ax": {"base_url": "http://ax:11434/v1", "model": "flash", "timeout_s": 30.0}}),
+        NUNCIO_ASSIST_PROVIDER="ax",
+    )
+    s = config.load_settings(env)
+    assert (s.assist_url, s.assist_model, s.assist_timeout_s) == (
+        "http://ax:11434/v1", "flash", 30.0)
+
+
+def test_masked_config_registry_view_never_carries_secrets():
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps(
+            {"ext": {"base_url": "https://user:pw@llm.example.com/v1",
+                     "model": "m", "api_key_ref": "EXT_LLM_KEY"}}),
+        EXT_LLM_KEY="canary-secret-value",
+    )
+    s = config.load_settings(env)
+    view = config.masked_config_dict(s)["NUNCIO_PROVIDERS_JSON"]
+    assert set(view) == {"ext"}
+    assert view["ext"]["api_key_ref"] == "EXT_LLM_KEY"
+    assert view["ext"]["key"] == "«set»"
+    blob = json.dumps(view)
+    assert "canary-secret-value" not in blob
+
+
+def test_providers_list_view_seeds_legacy_pseudo_entries():
+    s = config.load_settings(_registry_env(NUNCIO_ASSIST_URL="http://ax:11434"))
+    view = {row["id"]: row for row in config.providers_list_view(s)}
+    assert set(view) == {"private", "assist"}
+    assert all(row["source"] == "legacy" for row in view.values())
+    assert view["private"]["model"] == s.NUNCIO_LLM_MODEL
+
+
+def test_providers_list_view_prefers_registry_over_seeds():
+    env = _registry_env(
+        NUNCIO_PROVIDERS_JSON=json.dumps({"main": {"base_url": "http://llm:11434/v1"}}),
+        NUNCIO_ASSIST_URL="http://ax:11434",
+    )
+    s = config.load_settings(env)
+    view = config.providers_list_view(s)
+    assert [row["id"] for row in view] == ["main"]
+    assert view[0]["source"] == "registry"
+
+
+def test_resolve_provider_for_test_planes_and_unknown():
+    s = config.load_settings(_registry_env())
+    url, _key, model, _timeout, _headers = config.resolve_provider_for_test(s, "private")
+    assert url == s.NUNCIO_LLM_URL and model == s.NUNCIO_LLM_MODEL
+    assert config.resolve_provider_for_test(s, "nope") is None
+    assert config.resolve_provider_for_test(None, "private") is None
+    assert config.providers_list_view(None) == []
+
+
+def test_apply_changes_live_swaps_private_provider(tmp_path):
+    app, _settings = _app_with_data_dir(
+        tmp_path,
+        NUNCIO_PROVIDERS_JSON=json.dumps({
+            "a": {"base_url": "http://a:11434/v1"},
+            "b": {"base_url": "http://b:11434/v1"},
+        }),
+    )
+    assert "ollama:11434" in app.engine.llm.base_url  # legacy trio by default
+    result = config.apply_changes(app, {"NUNCIO_LLM_PROVIDER": "b"})
+    assert result["applied"] == ["NUNCIO_LLM_PROVIDER"]
+    assert "b:11434" in app.engine.llm.base_url
+    app.store.close()
+
+
+def test_apply_changes_rejects_unknown_provider_and_registry_write(tmp_path):
+    app, _settings = _app_with_data_dir(tmp_path)
+    with pytest.raises(config.SettingsValidationError) as exc:
+        config.apply_changes(app, {"NUNCIO_LLM_PROVIDER": "ghost"})
+    assert "_" in exc.value.errors  # candidate-level ConfigError attribution
+    with pytest.raises(config.SettingsValidationError) as exc2:
+        config.apply_changes(app, {"NUNCIO_PROVIDERS_JSON": "{}"})
+    assert "NUNCIO_PROVIDERS_JSON" in exc2.value.errors
+    app.store.close()
+
+
+def test_plane_info_carries_provider_ids(tmp_path):
+    app, settings = _app_with_data_dir(
+        tmp_path,
+        NUNCIO_PROVIDERS_JSON=json.dumps({"a": {"base_url": "http://a:11434/v1"}}),
+        NUNCIO_LLM_PROVIDER="a",
+    )
+    assert app.plane_info["private"]["provider"] == "a"
+    assert app.plane_info["private"]["model"] == settings.private_model
+    assert app.plane_info["knowledge"]["provider"] is None
+    app.store.close()
+
+
+def test_entry_headers_threaded_to_all_planes(tmp_path):
+    # Review regression (#3): entry headers must reach knowledge/assist
+    # builders and the test-probe resolver, not just the private plane.
+    app, settings = _app_with_data_dir(
+        tmp_path,
+        NUNCIO_PROVIDERS_JSON=json.dumps({
+            "a": {"base_url": "http://a:11434/v1", "headers": {"X-Tenant": "t"}}}),
+        NUNCIO_LLM_PROVIDER="a",
+        NUNCIO_KNOWLEDGE_PROVIDER="a",
+        NUNCIO_ASSIST_ENABLED="true",
+        NUNCIO_ASSIST_PROVIDER="a",
+    )
+    try:
+        assert app.engine.llm.extra_headers == {"X-Tenant": "t"}
+        assert app.engine.knowledge_llm.extra_headers == {"X-Tenant": "t"}
+        assert app.engine.assist.client._llm.extra_headers == {"X-Tenant": "t"}
+        url, _k, _m, _t, headers = config.resolve_provider_for_test(settings, "a")
+        assert headers == {"X-Tenant": "t"}
+        # knowledge pseudo-id path too
+        _u, _k2, _m2, _t2, h2 = config.resolve_provider_for_test(settings, "knowledge")
+        assert h2 == {"X-Tenant": "t"}
+    finally:
+        app.store.close()

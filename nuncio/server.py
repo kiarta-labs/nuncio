@@ -25,6 +25,10 @@ stdlib-only HTTP service (no web framework -> lighter, more native image):
   GET  /alerts.json   recent alerts (the dashboard's table data).
   GET  /alert/<key>   per-alert transparency drill-down (redacted bundle, timings).
   GET  /logo.png      the dashboard's header logo asset.
+  GET  /providers.json  provider registry listing (ids, redacted URLs, key
+                  presence) -- secrets never included.
+  GET  /providers/<id>/test  admin-gated live probe of one provider: a
+                  static no-alert-data ping. 401/403 without X-Admin-Token.
 
 A background maintenance thread is the never-lose safety net: it
 re-delivers, as raw, any undelivered row older than the deadline -- covering
@@ -38,11 +42,13 @@ and collaborator construction happens in `nuncio/config.py` (the composition
 root); `python -m nuncio` (nuncio/__main__.py) wires the two together.
 """
 import hmac
+import itertools
 import json
 import logging
 import queue
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -52,12 +58,18 @@ from nuncio.deadline import Deadline
 from nuncio.fingerprint import fingerprint
 from nuncio.model import categorize, real_host
 from nuncio.redactor import redact
+from nuncio.semantic import distribution as _semantic_distribution
 from nuncio.web import dashboard
 from nuncio.web import settings as settings_ui
 
 log = logging.getLogger("nuncio.server")
 
 _RECEIVED = "received"
+# Q2a: severity lanes for the priority work queue. Criticals always enrich
+# first during bursts (the observed shed class was criticals drowning behind
+# recoveries under FIFO); unknown joins warning (disposition treats it as a
+# problem); anything unrecognized joins warning rather than starving.
+_SEVERITY_PRIORITY = {"critical": 0, "warning": 1, "unknown": 1, "info": 2, "ok": 3}
 # Phase 5.1: the only values `?severity=` on an ingest URL may set. Anything
 # else (typo, unrecognized word, missing) is ignored, not errored -- a bad
 # query param must never fail the ingest, only fail to override.
@@ -87,6 +99,9 @@ class Metrics:
         # at status='received' (every maintenance retry exhausted) that got
         # deleted rather than retried forever.
         self.purged_stale_received = 0
+        # Q2: alerts folded into a digest window instead of enriched
+        # individually (status delivered_digested in the store).
+        self.digested = 0
         # Deep-RCA budget pass: LLM calls abandoned at their hard wall-clock
         # bound (`Engine._call_bounded`'s TimeoutError branch -- the thread
         # leaks until the socket timeout, so this is the one signal that
@@ -97,6 +112,11 @@ class Metrics:
         # When set, the renderer emits its trip counter and state as gauges;
         # None (hand-built Metrics in tests) just omits the lines.
         self.breaker = None
+        # P2: per-provider breaker map (wired by App like `breaker` above).
+        # Rendered as labelled series; empty/None omits them.
+        self.breakers = None
+        # C4: ingest-storm trips/activity (wired by App via `storm_state`).
+        self.storm = None
 
     def inc(self, attr, key=None, n=1):
         with self._lock:
@@ -126,11 +146,47 @@ class Metrics:
             lines.append(f"nuncio_assist_failed_total {self.assist_failed}")
             lines.append(f"nuncio_purged_stale_received_total {self.purged_stale_received}")
             lines.append(f"nuncio_llm_abandoned_total {self.llm_abandoned}")
+            lines.append(f"nuncio_digested_total {self.digested}")
             if self.breaker is not None:
                 lines.append(f"nuncio_llm_breaker_trips_total {self.breaker.trips}")
                 for st in ("closed", "half_open", "open"):
                     on = 1 if self.breaker.state == st else 0
                     lines.append(f'nuncio_llm_breaker_state{{state="{st}"}} {on}')
+            # C4: ingest-storm telemetry -- trips (lifetime count) and
+            # whether the storm-mode behaviour is currently active (gauge,
+            # so it returns to 0 the moment the storm clears).
+            try:
+                st = self.storm
+                if st is not None:
+                    lines.append(f"nuncio_storm_entered_total {st.get('entered', 0)}")
+                    lines.append(f"nuncio_storm_active {1 if st.get('active') else 0}")
+            except Exception:
+                pass
+            # P2: labelled per-provider series alongside the legacy
+            # unlabelled ones above (which track the ACTIVE breaker -- see
+            # build_app/apply_changes re-pointing). Same object may appear
+            # in both when a provider is selected; that duplication is
+            # deliberate (existing rules keep working post-cutover).
+            for pid in sorted((self.breakers or {})):
+                br = self.breakers[pid]
+                try:
+                    lines.append(f'nuncio_llm_breaker_trips_total{{provider="{pid}"}} {br.trips}')
+                    for st in ("closed", "half_open", "open"):
+                        on = 1 if br.state == st else 0
+                        lines.append(f'nuncio_llm_breaker_state{{provider="{pid}",state="{st}"}} {on}')
+                except Exception:
+                    continue
+            # C1: semantic-similarity distribution over recently scored
+            # correlated pairs (best-effort operational telemetry -- answers
+            # "is the Jaccard signal worth upgrading to embeddings?").
+            try:
+                dist = _semantic_distribution()
+                lines.append(f"nuncio_semantic_pairs_observed_total {dist['total']}")
+                lines.append(f"nuncio_semantic_similarity_p50 {dist['p50']:.3f}")
+                lines.append(f"nuncio_semantic_similarity_p90 {dist['p90']:.3f}")
+                lines.append(f"nuncio_semantic_similarity_max {dist['max']:.3f}")
+            except Exception:
+                pass
         return "\n".join(lines) + "\n"
 
 
@@ -151,17 +207,49 @@ class App:
                  # to the same 60.0 as NUNCIO_FULL_BUDGET_S's own schema
                  # default so a hand-built App (tests) that doesn't pass this
                  # still gets a sane, budget_s-dominant value in the common
-                 # case (budget_s <= 60).
-                 full_budget_s=60.0):
+                  # case (budget_s <= 60).
+                  full_budget_s=60.0,
+                  # P1: whether the private plane is currently trusted.
+                  # Captured per-alert at ingest (below) into the queue
+                  # tuple -- the worker/engine never re-resolve it, so a
+                  # live selector flip can't re-route an in-flight alert.
+                  # config.build_app sets this from the resolved registry;
+                  # hand-built Apps default to untrusted (zero behavior
+                  # change).
+                  private_trusted=False,
+                  # Q2: same-fingerprint generic info-severity coalescing
+                  # window (NUNCIO_DIGEST_WINDOW_S). 0.0 disables -- a
+                  # hand-built App that doesn't pass this behaves exactly
+                  # like before (every alert enriched individually).
+                  digest_window_s=0.0):
         self.engine = engine
         self.store = store
         self.metrics = metrics
+        # C4: ingest-storm state (defined before the metrics wiring below,
+        # which references it; see _bump_storm/in_storm for the model).
+        self._storm_rate_ts = deque()
+        self.storm_state = {"entered": 0, "active": False}
         # Wire the breaker into the metrics renderer (live state/trips gauge
         # on /metrics). Guarded so a fake Metrics in tests stays untouched.
         if self.metrics is not None and hasattr(self.metrics, "breaker"):
             self.metrics.breaker = getattr(engine, "breaker", None)
+        # P2: the per-provider breaker map for labelled series (same guard).
+        if self.metrics is not None and hasattr(self.metrics, "breakers"):
+            self.metrics.breakers = getattr(engine, "provider_breakers", None) or None
+        # C4: storm state for /metrics transparency (same guard).
+        if self.metrics is not None and hasattr(self.metrics, "storm"):
+            self.metrics.storm = self.storm_state
         self.budget_s = budget_s
         self.full_budget_s = full_budget_s
+        self.private_trusted = private_trusted
+        self.digest_window_s = digest_window_s or 0.0
+        # Q2 digest state: fingerprint -> {"first_at", "keys", "lines",
+        # "service", "host", "category"}. In-memory ONLY (never persisted):
+        # a restart loses open windows, and the next arrival starts a fresh
+        # one (fail-open -- the first notice always goes out immediately).
+        # RLock: sweeps emit via self.ingest, which re-enters this lock.
+        self._digest = {}
+        self._digest_lock = threading.RLock()
         self.clock = clock
         self.wall_clock = wall_clock
         self.maint_interval = maint_interval
@@ -189,7 +277,12 @@ class App:
         # works, with the settings screen simply reporting "not configured".
         self.settings = None
         self.boot_effective = {}
-        self.q = queue.Queue(maxsize=queue_max)
+        # Q2a: priority queue (severity lane, FIFO sequence within a lane).
+        # put_nowait/get/qsize/task_done/Full semantics are identical to
+        # queue.Queue; only the ORDER changes. The sequence counter makes
+        # every item unique so the queue never compares payload dicts.
+        self.q = queue.PriorityQueue(maxsize=queue_max)
+        self._qseq = itertools.count()
         # Batch 2 item C: in-memory per-key backoff for the maintenance
         # sweep -- key -> (next_retry_at, attempts). No schema change (this
         # is deliberately NOT persisted: on restart every key is retried
@@ -295,6 +388,20 @@ class App:
             if not newly:
                 self.metrics.inc("duplicates")
                 continue  # duplicate -- already handled/queued
+            # C4: record this ingest against the storm rate tracker (after
+            # the duplicate gate -- only genuinely-new alerts count).
+            try:
+                self._bump_storm(self.wall_clock())
+            except Exception:
+                pass
+            # Q2 digest: a generic info/ok notice inside an open window is
+            # folded into the digest (status delivered_digested) instead of
+            # queued for its own enrichment. The FIRST notice of a window
+            # always takes the normal path below (fail-open). Criticals and
+            # warnings never digest -- only quiet severities coalesce.
+            if self._maybe_digest(source_name, pa.key, raw, mode, severity,
+                                  host):
+                continue
             # BLOCKER 1 (Phase B): `depth` is captured HERE, at ingest, and
             # the Deadline is built from the MATCHING budget for that depth
             # -- `full_budget_s` for a full-depth alert, `budget_s`
@@ -306,6 +413,30 @@ class App:
             # `budget_s` Deadline would silently run its 2-call pipeline
             # under 30s instead of 60s (the bug this fixes).
             depth = getattr(self.engine, "depth", "full")
+            # Q2b: recovery notices skip deep RCA -- the disposition gate
+            # discards cause/checks for ok AFTER the LLM runs, so a full-depth
+            # 2-call pipeline on an ok alert is pure waste. Single call keeps
+            # the summary ("Resolved at ... after ...").
+            if severity == "ok":
+                depth = "low"
+            # C4: storm mode -- rate tripped, so non-critical problem alerts
+            # also take the cheap single-call path (criticals always stay
+            # full; they queue first under Q2a anyway).
+            if severity != "critical" and self.in_storm():
+                depth = "low"
+            # P1: capture trust HERE, at ingest, into the queue tuple (same
+            # discipline as mode/depth above). For a trusted alert also fork
+            # the UNREDACTED raw text: `raw` (queued below) is always the
+            # redacted form (persist/audit-safe); `raw_full` rides the tuple
+            # in memory only and never touches the store.
+            # P1/review: ALSO capture the provider id this alert trusted
+            # under, so Engine.process can fail closed if a live selector
+            # flip re-points the wire client mid-flight (an alert trusted
+            # under provider A must never be sent raw to a now-selected
+            # provider B) -- see Engine.process' choke point.
+            trusted = bool(self.private_trusted)
+            raw_full = pa.raw_text if (trusted and isinstance(pa.raw_text, str)) else None
+            provider_at_ingest = getattr(self.engine, "provider_id", None) if trusted else None
             deadline = Deadline(self.full_budget_s if depth == "full" else self.budget_s, clock=self.clock)
             try:
                 # `mode` rides the queue tuple (not re-read from self.engine.mode
@@ -318,17 +449,138 @@ class App:
                 # invariant (persist-before-ACK, load-shed just leaves the
                 # row persisted for the maintenance safety net) is identical
                 # for every mode.
-                self.q.put_nowait((pa.key, pa.alert, raw, deadline, mode, depth))
+                # Q2a: (lane, sequence) ordering prefix -- the worker strips
+                # it; depth/mode keep their capture-at-ingest discipline.
+                # P1 appends (raw_full, trusted): the unredacted raw text
+                # (memory-only, trusted alerts only) and the trust flag.
+                prio = _SEVERITY_PRIORITY.get(severity or "unknown", 1)
+                self.q.put_nowait((prio, next(self._qseq), pa.key, pa.alert, raw, raw_full,
+                                   deadline, mode, depth, trusted, provider_at_ingest))
                 self.metrics.queue_depth = self.q.qsize()
             except queue.Full:
                 # load-shed: leave it persisted; the maintenance thread delivers
                 # it raw at its deadline (does NOT block this handler).
                 self.metrics.inc("failures", "queue")
+        # Q2: emit any digest windows this batch closed out. Best-effort and
+        # self-isolating (_emit_digest never raises); a quiet period with no
+        # ingest traffic is covered by the maintenance pass instead. A sweep
+        # failure must never change this batch's persist-before-ACK status.
+        try:
+            self._sweep_digests()
+        except Exception:
+            log.warning("digest sweep failed", exc_info=True)
         return status
+
+    def _maybe_digest(self, source_name, key, raw, mode, severity, host):
+        """Q2c coalescing decision for one freshly-persisted alert. Returns
+        True when the alert was folded into its digest window (status now
+        delivered_digested -- the caller must NOT queue it). Returns False
+        for the first notice of a window and for everything digest-ineligible,
+        which all take the normal path.
+
+        Grouping key is (source, severity, host) -- deliberately NOT the
+        fingerprint: the observed burst class is heterogeneous services
+        flapping at once (a monitor sweep), which shares nothing
+        fingerprint-stable. Eligibility is deliberately narrow: generic
+        source, info/ok severity, enriched mode. A critical/warning or
+        failure-marked item always alerts immediately. Held rows are
+        terminally recorded, so a restart mid-window loses nothing that
+        wasn't already announced by the window's first notice (fail-open)."""
+        window = self.digest_window_s or 0
+        if not (window > 0 and source_name == "generic"
+                and severity in ("info", "ok") and mode == "enriched"):
+            return False
+        group = (source_name, severity, host)
+        now = self.wall_clock()
+        with self._digest_lock:
+            due = self._sweep_digests_locked(now)
+            ent = self._digest.get(group)
+            _first = (raw or "").strip().splitlines()
+            _line = (_first[0][:160] if _first else "(empty)")
+            if ent is None:
+                # Window opens with THIS notice. It takes the normal path
+                # (delivered individually -- fail-open) but is counted and
+                # remembered so the digest's "N notices" summary includes it
+                # and the earliest text isn't lost.
+                ent = {"first_at": now, "keys": [key], "lines": [_line],
+                       "host": host, "severity": severity}
+                self._digest[group] = ent
+                fresh = True
+            else:
+                fresh = False
+                if len(ent["keys"]) < self._DIGEST_MAX_KEYS:
+                    ent["keys"].append(key)
+                if len(ent["lines"]) < self._DIGEST_MAX_LINES:
+                    ent["lines"].append(_line)
+        for _expired_group, expired in due:
+            self._emit_digest(expired)
+        if fresh:
+            return False
+        try:
+            held = self.store.mark_digested(key)
+        except Exception:
+            held = False
+        if not held:
+            # CAS lost -- the row already moved on (worker/maintenance won a
+            # race). Fall through to the normal path; the worker's
+            # status != received guard makes that a safe no-op.
+            return False
+        self.metrics.inc("digested")
+        return True
+
+    def _sweep_digests_locked(self, now):
+        """Pop expired windows (and the oldest window past the group cap).
+        Caller holds _digest_lock. Returns [(group, entry)] for the caller
+        to emit AFTER releasing the lock."""
+        window = self.digest_window_s or 0
+        if window <= 0 or not self._digest:
+            return []
+        due = [(group, ent) for group, ent in self._digest.items()
+               if now - ent["first_at"] >= window]
+        for group, _ent in due:
+            del self._digest[group]
+        if len(self._digest) >= self._DIGEST_MAX_FPS:
+            oldest = min(self._digest, key=lambda k: self._digest[k]["first_at"])
+            due.append((oldest, self._digest.pop(oldest)))
+        return due
+
+    def _sweep_digests(self):
+        """Emit all expired digest windows. Called at the ingest tail and
+        once per maintenance pass; never raises (_emit_digest never raises)."""
+        now = self.wall_clock()
+        with self._digest_lock:
+            due = self._sweep_digests_locked(now)
+        for _expired_group, expired in due:
+            self._emit_digest(expired)
+
+    def _emit_digest(self, entry):
+        """Persist + ingest ONE digest alert for a closed window. Best-effort
+        throughout: failures here must never break the ingest path that
+        triggered the sweep (held rows are already terminally recorded, and
+        the window's first notice already went out). The digest re-enters
+        ingest as an ordinary generic notice (fresh window if one opens)."""
+        try:
+            keys = entry.get("keys") or []
+            if not keys:
+                return
+            lines = entry.get("lines") or []
+            body = [f"{len(keys)} similar notices coalesced ({entry.get('severity') or 'info'})"]
+            body += [f"- {ln}" for ln in lines]
+            if len(keys) > len(lines):
+                body.append(f"(+{len(keys) - len(lines)} more)")
+            payload = {"message": "\n".join(body), "severity": entry.get("severity") or "info"}
+            if entry.get("host"):
+                payload["host"] = entry["host"]
+            try:
+                self.ingest("generic", payload)
+            except Exception:
+                log.warning("digest emit failed", exc_info=True)
+        except Exception:
+            log.warning("digest emit failed", exc_info=True)
 
     def _worker(self):
         while True:
-            key, alert, raw, deadline, mode, depth = self.q.get()
+            _prio, _seq, key, alert, raw, raw_full, deadline, mode, depth, trusted, provider_at_ingest = self.q.get()
             try:
                 status = self.store.get_status(key)
                 # A non-'received' status here means a prior pass (or
@@ -342,11 +594,15 @@ class App:
                         # bypass has nothing to time out on -- still run it
                         # through the normal path rather than the generic
                         # deadline-expired raw fallback.
-                        outcome = self.engine.process(key, alert, raw, deadline=deadline, mode=mode, depth=depth)
+                        outcome = self.engine.process(key, alert, raw, deadline=deadline, mode=mode,
+                                                      depth=depth, trusted=trusted, raw_full=raw_full,
+                                                      provider_at_ingest=provider_at_ingest)
                     else:
                         outcome = self.engine._deliver_raw(key, raw, fail_stage="deadline")
                 else:
-                    outcome = self.engine.process(key, alert, raw, deadline=deadline, mode=mode, depth=depth)
+                    outcome = self.engine.process(key, alert, raw, deadline=deadline, mode=mode,
+                                                  depth=depth, trusted=trusted, raw_full=raw_full,
+                                                  provider_at_ingest=provider_at_ingest)
                 if outcome in ("enriched", "raw"):
                     self.metrics.inc("delivered", outcome)
                 elif outcome == "delivery_failed":
@@ -371,6 +627,54 @@ class App:
     # A row still at status='received' this long has exhausted every retry
     # the sweep offers and is permanently poisoned, not in-flight.
     _MAINT_STALE_RECEIVED_S = 7 * 86400
+    # Q2 digest bounds: max open windows (fingerprints) and max item lines
+    # retained per window. Both bound memory only -- overflow emits the
+    # oldest window early rather than dropping anything.
+    _DIGEST_MAX_FPS = 512
+    _DIGEST_MAX_LINES = 50
+    _DIGEST_MAX_KEYS = 128
+    # C4 storm-mode constants. Trips when >= _STORM_RATE alerts land within a
+    # 60s span; stays active for _STORM_ACTIVE_S after the last trip. Not
+    # settings knobs (deliberately CONNECTED to Q2's digest+priority work:
+    # this is the same observed sweep-burst class, and the cheap-path is the
+    # second lever on top of Q2a's ordering). /metrics exposes the state.
+    _STORM_WINDOW_S = 60.0
+    _STORM_RATE = 20
+    _STORM_ACTIVE_S = 300.0
+
+    def _bump_storm(self, now):
+        """Record one ingest at `now` (wall clock) and update storm state.
+        Guarded by the digest lock (same fast path, RLock -- reentrant from
+        digest emit). Best-effort and self-isolating: a storm tracker bug
+        must never break persist-before-ACK (wrapped by callers)."""
+        try:
+            with self._digest_lock:
+                cutoff = now - self._STORM_WINDOW_S
+                self._storm_rate_ts.append(now)
+                while self._storm_rate_ts and self._storm_rate_ts[0] < cutoff:
+                    self._storm_rate_ts.popleft()
+                if len(self._storm_rate_ts) >= self._STORM_RATE:
+                    self.storm_state["entered"] += 1
+                    self.storm_state["active"] = True
+                    self.storm_state["until"] = now + self._STORM_ACTIVE_S
+                if self.storm_state.get("active") and now >= self.storm_state.get("until", 0.0):
+                    self.storm_state["active"] = False
+        except Exception:
+            pass
+
+    def in_storm(self, now=None):
+        """True while storm mode is active (rate tripped within the active
+        window). Thread-safe read via the digest lock. Never raises."""
+        try:
+            now = self.wall_clock() if now is None else now
+            with self._digest_lock:
+                if self.storm_state.get("active") and now < self.storm_state.get("until", 0.0):
+                    return True
+                if self.storm_state.get("active"):
+                    self.storm_state["active"] = False
+            return False
+        except Exception:
+            return False
 
     def _maint_backoff_skip(self, key, now):
         until = self._maint_backoff.get(key)
@@ -463,6 +767,12 @@ class App:
             # plane is disabled or has nothing pending. Isolated so a
             # failure here (or above, fetching rows) never blocks the
             # duties below.
+            # Q2: emit expired digest windows (own isolation -- a digest bug
+            # must never starve the other duties).
+            try:
+                self._sweep_digests()
+            except Exception:
+                self.metrics.inc("failures", "maintenance")
             assist = getattr(self.engine, "assist", None)
             if assist is not None:
                 try:
@@ -569,12 +879,24 @@ def _handler_factory(app):
                 self._send(200, settings_ui.render_settings_html(app), ctype="text/html; charset=utf-8")
             elif path == "/settings.json":
                 self._send(200, settings_ui.render_settings_json(app), ctype="application/json")
+            elif path == "/providers.json":
+                from nuncio import config as _config
+                body = json.dumps(_config.providers_list_view(app.settings)).encode()
+                self._send(200, body, ctype="application/json")
+            elif path == "/feedback.json":
+                body = json.dumps(app.store.feedback_summary()).encode()
+                self._send(200, body, ctype="application/json")
+            elif path.startswith("/providers/") and path.endswith("/test"):
+                self._do_provider_test(app, path[len("/providers/"):-len("/test")])
             else:
                 self._send(404, b"not found")
 
         def do_POST(self):
             if self.path == "/settings":
                 self._do_post_settings()
+                return
+            if self.path == "/feedback":
+                self._do_post_feedback()
                 return
             split = urlsplit(self.path)
             path = split.path
@@ -642,6 +964,87 @@ def _handler_factory(app):
             # and Message.get() is; a plain dict built from it is not.
             status, result = settings_ui.handle_post(app, body_bytes, self.headers)
             self._send(status, json.dumps(result).encode(), ctype="application/json")
+
+        def _do_post_feedback(self):
+            """C6: admin-gated operator feedback (confirm_root | split | merge).
+            Same fail-closed auth as /settings; records best-effort into the
+            feedback table and lets the correction cache pick it up within the
+            hour. Body shape: {"key": ..., "action": ..., "ref_key": optional}."""
+            ok, code = settings_ui.check_admin_token(app, self.headers)
+            if not ok:
+                self._send(code, b'{"error": "admin token required"}', ctype="application/json")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length <= 0 or length > settings_ui.MAX_BODY_BYTES:
+                    self._send(413 if length > settings_ui.MAX_BODY_BYTES else 400,
+                               b'{"error": "bad request"}', ctype="application/json")
+                    return
+                payload = json.loads(self.rfile.read(length).decode())
+            except Exception:
+                self._send(400, b'{"error": "bad request"}', ctype="application/json")
+                return
+            key = payload.get("key") if isinstance(payload, dict) else None
+            action = payload.get("action") if isinstance(payload, dict) else None
+            ref_key = payload.get("ref_key") if isinstance(payload, dict) else None
+            if not isinstance(key, str) or not isinstance(action, str):
+                self._send(400, b'{"error": "key and action required"}', ctype="application/json")
+                return
+            if ref_key is not None and not isinstance(ref_key, str):
+                self._send(400, b'{"error": "ref_key must be a string"}', ctype="application/json")
+                return
+            if action not in app.store._FEEDBACK_ACTIONS:
+                self._send(400, b'{"error": "unknown action"}', ctype="application/json")
+                return
+            if action == "split" and not ref_key:
+                # split is a PAIR action: it needs the subject it splits from.
+                self._send(400, b'{"error": "split requires ref_key"}', ctype="application/json")
+                return
+            recorded = app.store.record_feedback(key, action, ref_key=ref_key)
+            if not recorded:
+                self._send(404, b'{"error": "unknown key (or duplicate)"}', ctype="application/json")
+                return
+            self._send(200, json.dumps({"applied": True, "action": action}).encode(),
+                       ctype="application/json")
+
+        def _do_provider_test(self, app, pid):
+            # Admin-gated live probe of one provider (see module docstring).
+            # Static "ping" payload -- no alert data, identifiers, or bundle
+            # content ever leaves on this path, by construction (the payload
+            # is a constant). Response carries latency + model echo only;
+            # error bodies carry the exception TYPE only, never the message
+            # (transport errors can echo the URL, which may embed basic-auth
+            # credentials).
+            ok, code = settings_ui.check_admin_token(app, self.headers)
+            if not ok:
+                self._send(code, b'{"error": "admin token required"}', ctype="application/json")
+                return
+            from nuncio import config as _config
+            resolved = _config.resolve_provider_for_test(app.settings, unquote(pid or ""))
+            if resolved is None:
+                self._send(404, b'{"error": "unknown provider"}', ctype="application/json")
+                return
+            base_url, key, model, timeout_s, headers = resolved
+            from nuncio.llm import LLMClient
+            bound = min(timeout_s or 10.0, 15.0)
+            client = LLMClient(base_url, key or "", model or "default", timeout=bound,
+                               extra_headers=headers or {})
+            start = time.monotonic()
+            try:
+                raw = client.enrich([{"role": "user", "content": "ping"}],
+                                    max_tokens=8, timeout=bound)
+            except Exception as e:
+                self._send(502, json.dumps({"ok": False, "error": type(e).__name__}).encode(),
+                           ctype="application/json")
+                return
+            content = raw[0] if isinstance(raw, tuple) and len(raw) == 2 else raw
+            body = {
+                "ok": True,
+                "latency_ms": int((time.monotonic() - start) * 1000),
+                "model": model or "default",
+                "echo": (content or "")[:64],
+            }
+            self._send(200, json.dumps(body).encode(), ctype="application/json")
 
         def log_message(self, *a):
             pass  # quiet; nuncio emits its own structured metrics/logs

@@ -80,6 +80,27 @@ class AssistClient:
             content = raw
         return content
 
+    def insight_trusted(self, raw_text, timeout=None):
+        """P1 trusted-leg call: `raw_text` is UNREDACTED alert content for an
+        alert whose private plane is trusted AND whose assist plane is
+        trusted (see Engine._deliver_enriched -- the ONLY caller that may
+        pass trusted=True through AssistTrack.submit). Deliberately NOT
+        gated on ScrubbedPayload (that would defeat the purpose); the
+        trust boundary here is the Engine's per-alert classification +
+        plane flags, never this method sniffing content. Same timeout
+        threading as insight() above."""
+        if not isinstance(raw_text, str):
+            raise TypeError(
+                "AssistClient.insight_trusted() requires a str "
+                f"-- got {type(raw_text).__name__!r}"
+            )
+        raw = self._llm.enrich(_assist_messages(raw_text), max_tokens=200, timeout=timeout)
+        if isinstance(raw, tuple) and len(raw) == 2:
+            content, _usage = raw
+        else:
+            content = raw
+        return content
+
 
 class AssistTrack:
     """The queue + worker + deferred-delivery/orphan-sweep machinery for the
@@ -113,13 +134,17 @@ class AssistTrack:
         never even reach the enrichment path that would call this)."""
         return mode == "enriched" and severity in self.severities
 
-    def submit(self, key, envelope, context_text, followup=False):
+    def submit(self, key, envelope, context_text, followup=False, trusted=False):
         """Non-blocking enqueue. Returns True if accepted, False if the
         queue is full (the caller — `Engine.process` — treats False as "the
         assist plane is saturated; delivery the rich copy right now with no
-        insight instead of waiting")."""
+        insight instead of waiting"). `trusted` (P1) marks items whose
+        context is UNREDACTED (trusted alert + trusted assist plane) -- the
+        worker calls insight_trusted and re-redacts before touching the
+        store. Callers must only pass trusted=True when both flags hold
+        (Engine._deliver_enriched enforces this)."""
         try:
-            self._q.put_nowait((key, envelope, context_text, followup))
+            self._q.put_nowait((key, envelope, context_text, followup, trusted))
             return True
         except queue.Full:
             return False
@@ -136,7 +161,7 @@ class AssistTrack:
             finally:
                 self._q.task_done()
 
-    def _process_item(self, key, envelope, context_text, followup):
+    def _process_item(self, key, envelope, context_text, followup, trusted=False):
         if self.metrics is not None:
             try:
                 self.metrics.inc("assist_attempted")
@@ -162,28 +187,47 @@ class AssistTrack:
             except Exception:
                 pass
 
-        payload = scrub_for_assist_plane(context_text or "")
+        payload = None
+        if not trusted:
+            payload = scrub_for_assist_plane(context_text or "")
         deadline = Deadline(self.timeout_s, clock=self._clock)
         bound = deadline.remaining()
         try:
-            raw_insight = run_bounded(lambda: self.client.insight(payload, timeout=bound), bound)
+            if trusted:
+                # P1 trusted leg: raw context straight to the trusted
+                # assist endpoint; NO scrub (that is the point of trust).
+                # The insight is re-redacted before the store write below,
+                # so raw text never rests there.
+                raw_insight = run_bounded(
+                    lambda: self.client.insight_trusted(context_text or "", timeout=bound), bound)
+            else:
+                raw_insight = run_bounded(lambda: self.client.insight(payload, timeout=bound), bound)
         except Exception as e:
             self._on_failure(key, envelope, followup, e)
             return
-        insight = redact(raw_insight or "")[0].strip()
+        if trusted:
+            insight = (raw_insight or "").strip()
+            store_insight = redact(insight)[0]
+        else:
+            insight = redact(raw_insight or "")[0].strip()
+            store_insight = insight
         if not insight:
             self._on_failure(key, envelope, followup, ValueError("empty assist response"))
             return
-        self._on_success(key, envelope, followup, insight)
+        self._on_success(key, envelope, followup, insight, store_insight=store_insight)
 
-    def _on_success(self, key, envelope, followup, insight):
+    def _on_success(self, key, envelope, followup, insight, store_insight=None):
         if self.metrics is not None:
             try:
                 self.metrics.inc("assist_ok")
             except Exception:
                 pass
         try:
-            self.store.record_stats(key, assist_status="done", assist_insight=insight)
+            # P1: store_insight is the re-redacted copy on the trusted leg
+            # (raw insight never rests in the store); identical to insight
+            # otherwise.
+            self.store.record_stats(key, assist_status="done",
+                                    assist_insight=store_insight if store_insight is not None else insight)
         except Exception:
             pass
         out_envelope = _followup_envelope(envelope, insight) if followup else _merge_insight(envelope, insight)

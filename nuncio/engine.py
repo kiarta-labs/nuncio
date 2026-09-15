@@ -32,7 +32,7 @@ from dataclasses import replace as _dc_replace
 from nuncio.bundle import assemble_bundle
 from nuncio.circuit import CircuitBreaker
 from nuncio.deadline import Deadline, run_bounded
-from nuncio.envelope import Envelope, build_detail_html, build_headline, severity_to_notify_type
+from nuncio.envelope import Envelope, best_display_name, build_detail_html, build_headline, severity_to_notify_type
 from nuncio.fingerprint import fingerprint as compute_fingerprint
 from nuncio.llm import LLMError
 from nuncio.model import categorize, disposition
@@ -46,6 +46,16 @@ from nuncio.render import build_envelope, RAW_FALLBACK_MARKER
 log = logging.getLogger("nuncio.engine")
 
 KNOWLEDGE_GUIDANCE_HEADER = "General guidance (knowledge plane)"
+
+
+def _passthrough_redact(text):
+    """Identity stand-in for nuncio.redactor.redact (same (text, findings)
+    shape, zero findings) -- the value-level redaction bypass for trusted
+    alerts (P1). Used ONLY through the `trusted` parameters below, never as
+    Engine._redact itself: store-bound writes (set_bundle audit, stats
+    columns) always go through the real redactor explicitly, so raw text can
+    never reach the store by forgetting a flag."""
+    return text, []
 
 # Mirrors the delivery-adapter ring's BRIEF/FULL string values WITHOUT
 # importing that ring module -- the core (this file) must never import an
@@ -190,14 +200,16 @@ class Engine:
                  validate_fn=validate_output, gatherer=None,
                  budget_s=30.0, per_attempt_s=10.0, delivery_budget_s=3.0,
                  gather_reserve_s=8.0, mode="enriched",
-                 clock=time.monotonic, wall_clock=time.time,
-                 router=None, knowledge_llm=None,
-                 fingerprint_window_s=172800, evidence_max_bytes=32000,
+                  clock=time.monotonic, wall_clock=time.time,
+                  router=None, knowledge_llm=None,
+                  knowledge_trusted=False, assist_trusted=False,
+                  fingerprint_window_s=172800, evidence_max_bytes=32000,
                  assist=None, enrich_format="auto",
                  depth="full", full_budget_s=60.0,
                  flap_threshold=0, flap_window_s=10800, flap_cooldown_s=3600,
-                 metrics=None,
-                 cb_fails=3, cb_window_s=300, cb_cooldown_s=60):
+                  metrics=None,
+                  cb_fails=3, cb_window_s=300, cb_cooldown_s=60,
+                  provider_breakers=None, provider_id=None):
         if mode not in VALID_MODES:
             raise ValueError(f"invalid NUNCIO_MODE: {mode!r}; must be one of {VALID_MODES}")
         if enrich_format not in VALID_ENRICH_FORMATS:
@@ -229,6 +241,16 @@ class Engine:
         # the knowledge-plane garnish calls `run_bounded` directly and is
         # deliberately NOT covered.
         self.breaker = CircuitBreaker(cb_fails, cb_window_s, cb_cooldown_s, clock=self._clock)
+        # P2: per-provider breaker isolation. provider_breakers maps
+        # registry id -> that provider's OWN CircuitBreaker (built by
+        # config.build_app with the same cb_* knobs); provider_id names the
+        # private plane's current provider (None = legacy trio). The funnel
+        # below always uses _active_breaker(): the selected provider's
+        # breaker when set, else self.breaker -- so trips/cooldowns are
+        # isolated per endpoint and survive selector flips, while
+        # provider-less installs behave exactly as before.
+        self.provider_breakers = dict(provider_breakers or {})
+        self.provider_id = provider_id
         # Knowledge plane: `router` gates which alert classes may reach it
         # (allowlist by construction -- see nuncio.router.Router),
         # `knowledge_llm` is the second LLMClient it's actually called
@@ -245,6 +267,15 @@ class Engine:
         # never turned on.
         self.router = router
         self.knowledge_llm = knowledge_llm
+        # P1: plane-level trust. knowledge_trusted/assist_trusted say whether
+        # a TRUSTED alert may use those planes at all (untrusted alerts are
+        # unaffected -- the planes' scrubbed-only contract is unchanged for
+        # them). Boot-time constants (the registry is env-only); refreshed on
+        # selector flips by config.apply_changes. The PRIVATE plane has no
+        # such flag here: trust is per-alert, threaded through process() by
+        # the caller (server.py captures it at ingest).
+        self.knowledge_trusted = knowledge_trusted
+        self.assist_trusted = assist_trusted
         # Batch B: recurrence headline suffix window (see nuncio.fingerprint)
         # and the HTML/plain-text evidence-section cap (see build_envelope's
         # sections_red / nuncio.envelope.build_detail_html).
@@ -292,7 +323,8 @@ class Engine:
         except Exception:
             pass
 
-    def process(self, key, alert, raw_text, deadline=None, mode=None, depth=None):
+    def process(self, key, alert, raw_text, deadline=None, mode=None, depth=None,
+                trusted=False, raw_full=None, provider_at_ingest=None):
         """Enrich + deliver one already-persisted alert. Returns
         'enriched' | 'raw' | 'delivery_failed'.
 
@@ -323,11 +355,35 @@ class Engine:
         A live NUNCIO_ENRICH_DEPTH settings-screen flip can therefore never
         re-route an alert that's already committed to a code path (and,
         critically, never orphan a `deadline` built for one budget onto the
-        other depth's pipeline)."""
+        other depth's pipeline).
+
+        `trusted` + `raw_full` (P1) are the trust-aware dual track, threaded
+        the same way (captured at ingest by server.py, never re-resolved):
+        a trusted alert's prompts, evidence, and delivered detail carry the
+        UNREDACTED content (`raw_full` + unmasked fields/sections), while
+        the store (set_bundle audit, stats columns) is re-redacted through
+        the real redactor -- raw text never rests there. `raw_full=None`
+        with trusted=True fails closed to the redacted `raw_text`.
+        `provider_at_ingest` (P1, review closure) is the provider id the
+        alert was captured under at ingest: if a live selector flip has
+        re-pointed the wire client since then, the alert is downgraded to
+        the fully-untrusted path -- an alert trusted under provider A must
+        NEVER be sent raw to a now-selected provider B (the endpoints may
+        differ in trust without anyone changing this alert's flags)."""
         if deadline is None:
             deadline = Deadline(self.budget_s, clock=self._clock)
         effective_mode = mode if mode is not None else self.mode
         effective_depth = depth if depth is not None else self.depth
+        # P1 fail-closed choke point: trust without its forked unredacted
+        # raw is meaningless (server.py always forks raw_full for trusted
+        # alerts) -- degrade to the fully-untrusted path rather than running
+        # a half-raw pipeline. Review closure: a provider identity mismatch
+        # (selector flip mid-flight) degrades exactly the same way.
+        if trusted:
+            if not isinstance(raw_full, str):
+                trusted = False
+            elif provider_at_ingest is not None and provider_at_ingest != getattr(self, "provider_id", None):
+                trusted = False
         # Batch 2 item G: flap suppression -- checked before anything else
         # (enrichment, bypass) so a suppressed repeat never runs an LLM call
         # or a delivery attempt at all, just a terminal store write.
@@ -341,9 +397,9 @@ class Engine:
                 raise _Fallback("deadline before start")
             min_lines = 2 if self.gatherer is not None else 1
             if effective_depth == "full" and self.gatherer is not None:
-                enrichment, usage, meta = self._enrich_full(alert, deadline, key)
+                enrichment, usage, meta = self._enrich_full(alert, deadline, key, trusted=trusted)
             else:
-                enrichment, usage, meta = self._enrich(alert, deadline, key)
+                enrichment, usage, meta = self._enrich(alert, deadline, key, trusted=trusted)
             structured = meta.get("enrich_format") == "structured"
             # Severity inference (LLM-classified) ONLY when the source
             # couldn't determine it -- a known, source-derived severity is
@@ -404,7 +460,8 @@ class Engine:
                 # to it, not end up trailing the unrelated "General guidance"
                 # addendum the knowledge plane may append after it.
                 enrichment = f"{enrichment.rstrip()}\n\n(severity inferred, not reported by the source)"
-            enrichment = self._garnish_with_knowledge(alert, enrichment, deadline, effective_depth)
+            enrichment = self._garnish_with_knowledge(alert, enrichment, deadline, effective_depth,
+                                                       trusted=trusted)
             if flap_note:
                 # Appended LAST (after the knowledge garnish) -- this is a
                 # delivery-level annotation about the alert's flapping
@@ -415,13 +472,27 @@ class Engine:
             sections_red = meta.get("sections_red") or {}
             # Mask secrets in the embedded raw — it egresses to the notification
             # channel (identifiers stay; it's the user's own channel).
+            # P1: the trusted leg embeds the unredacted raw instead; a
+            # trusted flag WITHOUT its raw_full fails closed to redacted.
+            envelope_raw = (raw_full if (trusted and isinstance(raw_full, str))
+                            else self._redact(raw_text)[0])
+            # S-track: deterministic identity + header block. The entity
+            # replaces LLM-composed identity in the headline; the header
+            # prepends severity/affected to the FULL detail only (summary
+            # and headline still read the issue first line above).
+            entity = best_display_name(alert)
+            sev_word = {"critical": "Critical", "warning": "Warning",
+                        "info": "Info", "ok": "OK", "unknown": "Unknown"}.get(
+                            severity, str(severity or "unknown").capitalize())
             envelope = build_envelope(
-                enrichment, self._redact(raw_text)[0],
+                enrichment, envelope_raw,
                 severity=severity,
                 host=alert.get("host") or "", service=alert.get("service") or "",
                 marker=False,
                 recurrence_count=recurrence_count, window_label=window_label,
                 sections_red=sections_red, evidence_max_bytes=self.evidence_max_bytes,
+                entity=entity,
+                header=f"Severity: {sev_word}\nAffected: {entity}",
             )
             if sections_red:
                 try:
@@ -429,7 +500,8 @@ class Engine:
                         envelope, sections_red=sections_red, cap_bytes=self.evidence_max_bytes))
                 except Exception:
                     pass  # keep build_envelope's own detail_html rather than strand the alert
-            return self._deliver_enriched(key, alert, envelope, sections_red, enrichment, usage, meta)
+            return self._deliver_enriched(key, alert, envelope, sections_red, enrichment, usage, meta,
+                                          trusted=trusted)
         except Exception as e:
             # ANY failure (LLM, validation, deadline, internal) -> raw + marker.
             raw_with_note = f"{raw_text.rstrip()}\n\n{flap_note}" if flap_note else raw_text
@@ -447,7 +519,8 @@ class Engine:
         fn = getattr(self.delivery, "has_verbosity", None)
         return bool(fn(verbosity)) if fn is not None else False
 
-    def _deliver_enriched(self, key, alert, envelope, sections_red, enrichment, usage, meta):
+    def _deliver_enriched(self, key, alert, envelope, sections_red, enrichment, usage, meta,
+                            trusted=False):
         """The enriched happy-path delivery, INCLUDING the Batch-C assist-plane
         deferral decision.
 
@@ -494,6 +567,12 @@ class Engine:
         # `.has_verbosity()`, and must keep working unchanged when
         # `self.assist` is None (the default) -- see `_delivery_has_verbosity`.
         assist_eligible = self.assist is not None and self.assist.eligible(envelope.severity, "enriched")
+        # P1: a trusted alert never defers to (or follows up via) an
+        # untrusted assist plane -- the rich leg ships immediately, in full,
+        # with no insight. (A trusted assist plane is served below via
+        # insight_trusted; see AssistTrack.submit's trusted flag.)
+        if trusted and not self.assist_trusted:
+            assist_eligible = False
         has_full = has_brief = False
         if assist_eligible:
             has_full = self._delivery_has_verbosity(_FULL)
@@ -512,13 +591,15 @@ class Engine:
                                     redaction_count=meta.get("redaction_count"),
                                     bundle_bytes=meta.get("bundle_bytes"),
                                     enrichment_text=enrichment,
-                                    enrich_format=meta.get("enrich_format"))
+                                    enrich_format=meta.get("enrich_format"),
+                                    trusted=trusted)
                 try:
                     self.store.record_stats(key, assist_status="deferred")
                 except Exception:
                     pass
                 context_text = self._build_assist_context(alert, sections_red, enrichment, envelope)
-                if not self.assist.submit(key, envelope, context_text):
+                if not self.assist.submit(key, envelope, context_text,
+                                          trusted=trusted and self.assist_trusted):
                     # Assist queue saturated -- deliver the rich leg right now
                     # with no insight rather than silently losing it. Status
                     # is recorded BEFORE the send (mirrors the orphan sweep's
@@ -550,21 +631,27 @@ class Engine:
                                 redaction_count=meta.get("redaction_count"),
                                 bundle_bytes=meta.get("bundle_bytes"),
                                 enrichment_text=enrichment,
-                                enrich_format=meta.get("enrich_format"))
+                                enrich_format=meta.get("enrich_format"),
+                                trusted=trusted)
             if assist_eligible and has_full:
                 # No brief leg was (successfully) deferred past -- the alert
                 # already went out in full above. The assist result, if any,
                 # arrives later as a separate follow-up message.
                 context_text = self._build_assist_context(alert, sections_red, enrichment, envelope)
-                self.assist.submit(key, envelope, context_text, followup=True)
+                self.assist.submit(key, envelope, context_text, followup=True,
+                                   trusted=trusted and self.assist_trusted)
             return "enriched"
         return "delivery_failed"  # channel down: leave for drain
 
     def _build_assist_context(self, alert, sections_red, enrichment_text, envelope):
-        """The (already-redacted) text handed to the assist plane, BEFORE
-        the assist-plane scrubber runs (see nuncio.redactor.scrub_for_assist_plane,
-        applied by AssistTrack's worker) -- this method decides WHAT goes in,
-        not how it's further scrubbed.
+        """The text handed to the assist plane, BEFORE the assist-plane
+        scrubber runs (see nuncio.redactor.scrub_for_assist_plane, applied
+        by AssistTrack's worker for untrusted items) -- this method decides
+        WHAT goes in, not how it's further scrubbed. P1: on the trusted leg
+        (trusted alert + trusted assist plane) the inputs below are RAW
+        (unredacted fields/sections/enrichment) and the worker calls
+        insight_trusted instead of scrubbing; otherwise everything here is
+        already-redacted as before.
 
         Posture is a data-exposure policy, read from `self.assist.posture`:
           - "generic": the alert's category + severity + this deployment's
@@ -707,36 +794,43 @@ class Engine:
         except Exception:
             return 0, ""
 
-    def _redact_field(self, v):
+    def _redact_field(self, v, trusted=False):
         """Redact one alert-dict value regardless of its JSON type. See the
         comment in `_enrich` for why non-strings go through json.dumps rather
         than str()/repr(). Returns (redacted_text, finding_count) — the count
         feeds the dashboard's `redaction_count` stat, and this is the one
         place every alert field's redaction findings are visible, so it's the
-        natural place to tally them rather than re-deriving the count later."""
+        natural place to tally them rather than re-deriving the count later.
+
+        `trusted` (P1) keeps the type coercion but skips masking entirely
+        (count 0) -- the caller routes store-bound copies through the real
+        redactor separately."""
         if v is None:
             return None, 0
         if isinstance(v, str):
-            text, findings = self._redact(v)
+            text_in = v
         else:
             try:
                 text_in = json.dumps(v, sort_keys=True, default=str)
             except Exception:
                 text_in = str(v)
-            text, findings = self._redact(text_in)
+        if trusted:
+            return text_in, 0
+        text, findings = self._redact(text_in)
         count = count_redactions(findings)
         return text, count
 
-    def _redact_alert_fields(self, alert):
+    def _redact_alert_fields(self, alert, trusted=False):
         """Redact every field of `alert` (see `_redact_field`'s docstring for
         why non-strings go through json.dumps rather than str()/repr()).
         Returns `(red_alert, redaction_count)`. Extracted from `_enrich` so
         `_enrich_full` (Phase B) can build its own redacted alert copy
-        through the exact same discipline."""
+        through the exact same discipline. `trusted` passes values through
+        unmasked (count 0) -- for prompt construction on the trusted leg."""
         red_alert = {}
         redaction_count = 0
         for k, v in alert.items():
-            text, count = self._redact_field(v)
+            text, count = self._redact_field(v, trusted=trusted)
             red_alert[k] = text
             redaction_count += count
         return red_alert, redaction_count
@@ -754,7 +848,8 @@ class Engine:
             and getattr(self.llm, "_json_object_supported", None) is not False
         )
 
-    def _gather_standard(self, alert, red_alert, deadline, key, use_structured, seed_sections=None):
+    def _gather_standard(self, alert, red_alert, deadline, key, use_structured, seed_sections=None,
+                         trusted=False):
         """The standard (non-deep) Level-B gather + message-build, shared by
         `_enrich` and `_enrich_full`'s degraded (tight-budget) path.
 
@@ -765,6 +860,11 @@ class Engine:
         name (unusual, but not impossible) wins; this is also what lets the
         degraded full-depth path ship the `history` section even when there
         isn't enough budget left to gather anything else.
+
+        `trusted` (P1): gathered sections pass through unmasked (count 0)
+        for prompts AND the envelope's evidence sections; the set_bundle
+        audit write below is re-redacted through the real redactor, so the
+        store still never sees raw text.
 
         Returns `(messages, sections_red, bundle_bytes, redaction_count)` --
         `redaction_count` here is only the DELTA contributed by bundle
@@ -789,6 +889,9 @@ class Engine:
             _, sections = self.gatherer.gather(
                 alert, key, self._wall_clock(), timeout=gather_budget, return_sections=True)
             for name, text in sections.items():
+                if trusted:
+                    sections_red[name] = text
+                    continue
                 t, findings = self._redact(text)
                 sections_red[name] = t
                 redaction_count += count_redactions(findings)
@@ -802,7 +905,10 @@ class Engine:
             bundle_red = assemble_bundle(sections_red, self.gatherer.max_bytes)
             bundle_bytes = len(bundle_red.encode("utf-8", errors="ignore"))
             try:
-                self.store.set_bundle(key, bundle_red)  # audit trail (redacted only)
+                # P1: the audit trail is redacted-only even when the
+                # prompt-bound bundle above is raw (trusted leg).
+                self.store.set_bundle(
+                    key, bundle_red if not trusted else self._redact(bundle_red)[0])
             except Exception:
                 pass
         else:
@@ -810,14 +916,18 @@ class Engine:
         messages = self._build_messages_b(red_alert, bundle_red, structured=use_structured)
         return messages, sections_red, bundle_bytes, redaction_count
 
-    def _enrich(self, alert, deadline, key):
-        red_alert, redaction_count = self._redact_alert_fields(alert)
+    def _enrich(self, alert, deadline, key, trusted=False):
+        # P1: trusted passes alert fields AND bundle sections through
+        # unmasked (count 0); red_alert/sections_red then hold RAW content
+        # for prompts, evidence, and delivery, while set_bundle (inside
+        # _gather_standard) and the stats columns stay redacted.
+        red_alert, redaction_count = self._redact_alert_fields(alert, trusted=trusted)
         use_structured = self._use_structured()
         messages, sections_red, bundle_bytes, extra_red = self._gather_standard(
-            alert, red_alert, deadline, key, use_structured)
+            alert, red_alert, deadline, key, use_structured, trusted=trusted)
         redaction_count += extra_red
         content, usage, llm_ms, enrich_format, severity_inferred = self._run_structured_call(
-            messages, deadline, use_structured, alert=alert)
+            messages, deadline, use_structured, alert=alert, trusted=trusted)
         meta = {
             "redaction_count": redaction_count, "bundle_bytes": bundle_bytes, "llm_ms": llm_ms,
             "sections_red": sections_red, "enrich_format": enrich_format,
@@ -825,7 +935,7 @@ class Engine:
         }
         return content, usage, meta
 
-    def _enrich_full(self, alert, deadline, key):
+    def _enrich_full(self, alert, deadline, key, trusted=False):
         """Phase B, full depth (the default): recent-alert-history
         correlation + a bounded 2-call pipeline (fast plain-text triage, then
         a deep RCA call over a richer context bundle). Structured so that:
@@ -854,7 +964,11 @@ class Engine:
         case the min() caps below clamp each bound to the remaining time):
         10s gather + 15s triage + 45s RCA + 3s delivery reserve = 73s <= 90s."""
         now = self._wall_clock()
-        red_alert, redaction_count = self._redact_alert_fields(alert)
+        # P1: trusted coerces without masking (see _enrich); the names below
+        # keep their historical shape so every downstream consumer is
+        # untouched -- when trusted they hold RAW content for prompts,
+        # evidence, and delivery.
+        red_alert, redaction_count = self._redact_alert_fields(alert, trusted=trusted)
         use_structured = self._use_structured()
 
         # 1. Store-only sections -- ALWAYS computed (cheap, no network I/O),
@@ -864,13 +978,16 @@ class Engine:
         # gracefully on a gatherer that only implements `.gather()`.
         sections_red = {}
         collectors = getattr(self.gatherer, "collectors", None) or {}
-        for name in ("correlated", "recurrence", "history"):
+        for name in ("correlated", "recurrence", "history", "changes", "past_incidents"):
             fn = collectors.get(name)
             if fn is None:
                 continue
             try:
                 text = fn(alert, key, now)
             except Exception:
+                continue
+            if trusted:
+                sections_red[name] = text
                 continue
             t, findings = self._redact(text)
             sections_red[name] = t
@@ -882,10 +999,11 @@ class Engine:
             # standard single Level-B path, WITH the store-only sections
             # (incl. `history`) merged in.
             messages, sections_red, bundle_bytes, extra_red = self._gather_standard(
-                alert, red_alert, deadline, key, use_structured, seed_sections=sections_red)
+                alert, red_alert, deadline, key, use_structured, seed_sections=sections_red,
+                trusted=trusted)
             redaction_count += extra_red
             content, usage, llm_ms, enrich_format, severity_inferred = self._run_structured_call(
-                messages, deadline, use_structured, alert=alert)
+                messages, deadline, use_structured, alert=alert, trusted=trusted)
             meta = {
                 "redaction_count": redaction_count, "bundle_bytes": bundle_bytes, "llm_ms": llm_ms,
                 "sections_red": sections_red, "enrich_format": enrich_format,
@@ -903,8 +1021,11 @@ class Engine:
         except Exception:
             extra_sections = {}
         for name, text in extra_sections.items():
-            if name in ("correlated", "recurrence", "history"):
+            if name in ("correlated", "recurrence", "history", "changes", "past_incidents"):
                 continue  # store-only, already handled above -- never double-count/overwrite
+            if trusted:
+                sections_red[name] = text
+                continue
             t, findings = self._redact(text)
             sections_red[name] = t
             redaction_count += count_redactions(findings)
@@ -912,7 +1033,8 @@ class Engine:
         bundle_red = assemble_bundle(sections_red, deep_cap)
         bundle_bytes = len(bundle_red.encode("utf-8", errors="ignore"))
         try:
-            self.store.set_bundle(key, bundle_red)  # audit trail (redacted only)
+            # P1: audit stays redacted-only even on the trusted leg.
+            self.store.set_bundle(key, bundle_red if not trusted else self._redact(bundle_red)[0])
         except Exception:
             pass
 
@@ -974,11 +1096,13 @@ class Engine:
             if tight_bound < _FULL_RCA_TIGHT_MIN_S:
                 raise _Fallback("deadline")
             content, usage, llm_ms, enrich_format, severity_inferred = self._run_structured_call(  # pragma: no cover
-                messages, deadline, use_structured, alert=alert, bound=tight_bound, allow_retry=False)
+                messages, deadline, use_structured, alert=alert, bound=tight_bound, allow_retry=False,
+                trusted=trusted)
         else:
             content, usage, llm_ms, enrich_format, severity_inferred = self._run_structured_call(
                 messages, deadline, use_structured, alert=alert, bound=rca_bound,
-                retry_cost=rca_bound + _FULL_RCA_DELIVERY_RESERVE_S, allow_retry=True)
+                retry_cost=rca_bound + _FULL_RCA_DELIVERY_RESERVE_S, allow_retry=True,
+                trusted=trusted)
 
         meta = {
             "redaction_count": redaction_count, "bundle_bytes": bundle_bytes,
@@ -989,13 +1113,17 @@ class Engine:
         return content, _sum_usage(triage_usage, usage), meta
 
     def _run_structured_call(self, messages, deadline, use_structured, alert=None, bound=None,
-                              retry_cost=None, allow_retry=True):
+                               retry_cost=None, allow_retry=True, trusted=False):
         """The parse/validate/redact/render half of the format ladder,
         wrapping `_call_llm_with_ladder`'s LLM-call half -- extracted from
         `_enrich` so `_enrich_full`'s deep RCA call (and its degraded/tight
         single-call fallbacks) go through the EXACT same structured contract
         as every standard call. Returns
         `(content, usage, llm_ms, enrich_format, severity_inferred)`.
+
+        `trusted` (P1) skips the output echo-redact below (model fields pass
+        through verbatim on the trusted leg); the disposition hard gate
+        still applies in both tiers.
 
         `alert` (Phase 2) is THIS call's alert dict, used ONLY to compute its
         determinism-doctrine disposition (nuncio.model.disposition, keyed off
@@ -1025,13 +1153,16 @@ class Engine:
                 fields = validate_structured(parsed)
                 if fields is None:
                     raise _Fallback("structured validation: validate_structured")
+                # P1: output echo-redact is skipped on the trusted leg (the
+                # delivered detail intentionally carries raw content there).
+                _echo_redact = _passthrough_redact if trusted else self._redact
                 for k in ("summary", "likely_cause"):
-                    fields[k] = self._redact(fields[k])[0]
+                    fields[k] = _echo_redact(fields[k])[0]
                 if isinstance(fields["correlation"], str):
-                    fields["correlation"] = self._redact(fields["correlation"])[0]
+                    fields["correlation"] = _echo_redact(fields["correlation"])[0]
                 elif isinstance(fields["correlation"], list):
-                    fields["correlation"] = [self._redact(c)[0] for c in fields["correlation"]]
-                fields["checks"] = [self._redact(c)[0] for c in fields["checks"]]
+                    fields["correlation"] = [_echo_redact(c)[0] for c in fields["correlation"]]
+                fields["checks"] = [_echo_redact(c)[0] for c in fields["checks"]]
                 if disp != "problem":
                     # Determinism doctrine's HARD gate: even a fully
                     # non-compliant model that ignored the prompt-side
@@ -1059,7 +1190,9 @@ class Engine:
             # is the text rung's half of the same hard gate -- drops any
             # "Likely caused by"/"Next:" line for a non-"problem" disposition.
             content = normalize_enrichment(content, disposition=disp)
-            content = self._redact(content)[0]
+            # P1: same echo-redact bypass as the structured rung above.
+            content = (_passthrough_redact(content)[0] if trusted
+                       else self._redact(content)[0])
 
         return content, usage, llm_ms, enrich_format, severity_inferred
 
@@ -1146,6 +1279,17 @@ class Engine:
                 pass
         raise _Fallback("structured validation: json_parse")
 
+    def _active_breaker(self):
+        """The CircuitBreaker the private-plane funnel accounts against:
+        the selected provider's own breaker when one is selected, else the
+        default breaker. Single lookup so _call_bounded never consults the
+        map directly (and tests can pin this one method)."""
+        if self.provider_id is not None:
+            breaker = self.provider_breakers.get(self.provider_id)
+            if breaker is not None:
+                return breaker
+        return self.breaker
+
     def _call_bounded(self, messages, deadline, response_format=None, bound=None):
         """Run the LLM call with a HARD wall-clock bound so a hung/slow-drip
         response can't freeze the worker past the deadline (urllib's timeout is
@@ -1170,11 +1314,12 @@ class Engine:
         never allowed to run past the alert's own deadline."""
         eff_per_attempt = bound if bound is not None else self.per_attempt_s
         bound = min(eff_per_attempt, max(0.1, deadline.remaining()))
-        if not self.breaker.allow():
+        breaker = self._active_breaker()
+        if not breaker.allow():
             raise LLMError(
-                f"LLM circuit open after {self.breaker.failure_count} retryable "
-                f"failure(s) within {self.breaker.window_s}s (cooldown "
-                f"{self.breaker.cooldown_left():.0f}s remaining)",
+                f"LLM circuit open after {breaker.failure_count} retryable "
+                f"failure(s) within {breaker.window_s}s (cooldown "
+                f"{breaker.cooldown_left():.0f}s remaining)",
                 retryable=False,
             )
         t0 = self._wall_clock()
@@ -1200,9 +1345,9 @@ class Engine:
             raise err
         except LLMError as e:
             if e.retryable:
-                self.breaker.record_failure()
+                breaker.record_failure()
             raise
-        self.breaker.record_success()
+        breaker.record_success()
         elapsed = max(0.0, self._wall_clock() - t0)
         if isinstance(raw, tuple) and len(raw) == 2:
             content, usage = raw
@@ -1210,7 +1355,7 @@ class Engine:
             content, usage = raw, None
         return content, usage, elapsed
 
-    def _garnish_with_knowledge(self, alert, enrichment_text, deadline, depth=None):
+    def _garnish_with_knowledge(self, alert, enrichment_text, deadline, depth=None, trusted=False):
         """Best-effort knowledge-plane garnish, called AFTER the private-plane
         enrichment has already been produced and validated. Structurally
         privacy-preserving: the ONLY thing that can ever reach
@@ -1254,12 +1399,28 @@ class Engine:
         delivery dependency."""
         if self.router is None or self.knowledge_llm is None:
             return enrichment_text
+        # P1: a trusted alert skips the knowledge plane UNLESS that plane's
+        # own provider is also trusted -- raw alert text must never reach a
+        # hosted endpoint by accident. (The garnish payload itself is always
+        # generic, but the skip also saves a pointless call.)
+        if trusted and not self.knowledge_trusted:
+            log.debug("knowledge-plane garnish skipped: trusted alert, knowledge plane not trusted")
+            return enrichment_text
         effective_depth = depth if depth is not None else self.depth
         if effective_depth == "full" and getattr(self.router, "knowledge_redundant_with_private", False):
             log.debug(
                 "knowledge-plane garnish skipped: full depth + knowledge endpoint/model identical to the "
                 "private plane (redundant with the deep RCA call already run)"
             )
+            return enrichment_text
+        # Recovery/info legs get no garnish: a resolved or informational alert
+        # must not carry a problem-framed generic essay. Same authority as
+        # the cause/checks disposition gate below -- the disposition decides,
+        # not the prompt. Returns before spending any budget or LLM call.
+        disp = disposition(alert.get("severity") or "unknown") if isinstance(alert, dict) else "problem"
+        if disp != "problem":
+            log.debug(
+                "knowledge-plane garnish skipped: disposition is %r, not a problem leg", disp)
             return enrichment_text
         try:
             alert_class = (alert.get("category") if isinstance(alert, dict) else None) \
@@ -1392,7 +1553,7 @@ class Engine:
 
     def _record_stats(self, key, outcome=None, fail_stage=None, tokens=None,
                        llm_ms=None, redaction_count=None, bundle_bytes=None,
-                       enrichment_text=None, enrich_format=None):
+                       enrichment_text=None, enrich_format=None, trusted=False):
         """Best-effort dashboard-stats write.
 
         HARD RULE (see the module docstring): every call site invokes this
@@ -1416,7 +1577,10 @@ class Engine:
             if bundle_bytes is not None:
                 fields["bundle_bytes"] = bundle_bytes
             if enrichment_text is not None:
-                fields["enrichment"] = enrichment_text
+                # P1: the store's enrichment column is redacted-only even
+                # when the delivered copy was raw (trusted leg).
+                fields["enrichment"] = (self._redact(enrichment_text)[0] if trusted
+                                        else enrichment_text)
             if enrich_format is not None:
                 fields["enrich_format"] = enrich_format
             if tokens:

@@ -29,11 +29,11 @@ from nuncio.model import (  # noqa: F401 — re-exported for back-compat
 log = logging.getLogger("nuncio.gatherer")
 
 _CATEGORY_COLLECTORS = {
-    "container": ["recent_logs", "container_state", "correlated", "recurrence"],
-    "storage": ["recent_logs", "metrics", "correlated", "recurrence"],
-    "hardware": ["kernel", "metrics", "correlated", "recurrence"],
-    "network": ["metrics", "recent_logs", "correlated", "recurrence"],
-    "generic": ["recent_logs", "correlated", "recurrence"],
+    "container": ["recent_logs", "container_state", "correlated", "recurrence", "changes"],
+    "storage": ["recent_logs", "metrics", "correlated", "recurrence", "changes"],
+    "hardware": ["kernel", "metrics", "correlated", "recurrence", "changes"],
+    "network": ["metrics", "recent_logs", "correlated", "recurrence", "changes"],
+    "generic": ["recent_logs", "correlated", "recurrence", "changes"],
 }
 
 # Batch 2 item F: best-effort "this collector's query succeeded but found
@@ -57,6 +57,7 @@ _EMPTY_MARKERS = {
     "correlated": ("\n(none",),
     "recurrence": ("(no stable signature for this alert)", "(first occurrence in"),
     "history": ("(no related alerts)",),
+    "changes": ("(no recent changes)",),
 }
 
 

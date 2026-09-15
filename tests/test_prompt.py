@@ -232,7 +232,7 @@ def test_level_b_structured_true_uses_json_output_format_block():
 
 
 def test_json_output_format_names_exact_keys():
-    assert '"summary"' in _JSON_OUTPUT_FORMAT
+    assert '"issue"' in _JSON_OUTPUT_FORMAT
     assert '"likely_cause"' in _JSON_OUTPUT_FORMAT
     assert '"correlation"' in _JSON_OUTPUT_FORMAT
     assert '"checks"' in _JSON_OUTPUT_FORMAT
@@ -244,7 +244,7 @@ def test_json_output_format_forbids_severity_in_value():
 
 
 def test_json_output_format_includes_worked_example():
-    assert '"summary":' in _JSON_OUTPUT_FORMAT and "{" in _JSON_OUTPUT_FORMAT.split("Example")[-1]
+    assert '"issue":' in _JSON_OUTPUT_FORMAT and "{" in _JSON_OUTPUT_FORMAT.split("Example")[-1]
 
 
 def test_level_a_structured_severity_unknown_uses_json_severity_addendum():
@@ -551,6 +551,30 @@ def test_validate_structured_rejects_oversized_serialized():
     assert validate_structured({"summary": "db-primary is down on host01", "likely_cause": "z" * 5000}) is None
 
 
+def test_validate_structured_accepts_issue_key():
+    # S-track dual contract: "issue" normalizes into the stable "summary"
+    # result key, so renderers are untouched by the rename.
+    out = validate_structured({"issue": "db-primary is down on host01"})
+    assert out["summary"] == "db-primary is down on host01"
+
+
+def test_validate_structured_issue_prefers_over_legacy_summary():
+    out = validate_structured({"issue": "db-primary is down on host01",
+                               "summary": "something else entirely here"})
+    assert out["summary"] == "db-primary is down on host01"
+
+
+def test_validate_structured_issue_cap_is_140_not_250():
+    assert validate_structured({"issue": "x" * 141}) is None
+    assert validate_structured({"issue": "x" * 140})["summary"] == "x" * 140
+    # legacy summary keeps its own 250 cap
+    assert validate_structured({"summary": "x" * 200})["summary"] == "x" * 200
+
+
+def test_validate_structured_invalid_issue_never_falls_back_to_summary():
+    assert validate_structured({"issue": "short", "summary": "db-primary is down on host01"}) is None
+
+
 # --- normalize_enrichment ---
 
 def test_normalize_enrichment_strips_bold_heading_labels():
@@ -846,7 +870,7 @@ _GOLDEN_LEVEL_B_USER = (
 _GOLDEN_FULL_TRIAGE_USER = (
     "## Alert\nhost: host01\nservice: infisical-postgres\nstate: CRIT\n"
     "output: FATAL: all AuxiliaryProcs are in use\ntime: 2026-07-17 09:00:00"
-    "\n\n## History/correlation context\n«BUNDLE-START»\nh\n«BUNDLE-END»"
+    "\n\n## History/correlation/changes context\n«BUNDLE-START»\nh\n«BUNDLE-END»"
 )
 
 
@@ -1156,9 +1180,9 @@ import re as _re
 
 
 def _extract_json_examples(text):
-    """Pull every `{"summary": ...}`-shaped worked example out of a
+    """Pull every `{"issue": ...}`-shaped worked example out of a
     _JSON_OUTPUT_FORMAT-style block and json.loads each one."""
-    raw = _re.findall(r'\{"summary".*\}', text)
+    raw = _re.findall(r'\{"issue".*\}', text)
     assert raw, "expected at least one worked JSON example"
     return [_json.loads(r) for r in raw]
 
@@ -1170,7 +1194,7 @@ def test_json_output_format_has_at_least_two_worked_examples():
 
 def test_json_output_format_examples_police_their_own_word_budgets():
     for ex in _extract_json_examples(_JSON_OUTPUT_FORMAT):
-        assert len(ex["summary"].split()) <= 12, ex["summary"]
+        assert len(ex["issue"].split()) <= 12, ex["issue"]
         if ex.get("likely_cause"):
             assert len(ex["likely_cause"].split()) <= 20, ex["likely_cause"]
         for check in ex.get("checks") or []:
@@ -1179,15 +1203,15 @@ def test_json_output_format_examples_police_their_own_word_budgets():
 
 def test_json_output_format_examples_have_no_four_digit_year():
     for ex in _extract_json_examples(_JSON_OUTPUT_FORMAT):
-        assert not _re.search(r"\b\d{4}\b", ex["summary"]), ex["summary"]
+        assert not _re.search(r"\b\d{4}\b", ex["issue"]), ex["issue"]
 
 
-def test_json_output_format_examples_summary_has_no_dotted_hostname():
-    # A dotted hostname (e.g. "router.example.net") in the summary is exactly
+def test_json_output_format_examples_issue_has_no_dotted_hostname():
+    # A dotted hostname (e.g. "router.example.net") in the issue is exactly
     # the kind of entity-repetition the headline already carries -- the
     # rewritten example must not reintroduce it.
     for ex in _extract_json_examples(_JSON_OUTPUT_FORMAT):
-        assert not _re.search(r"\b[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\b", ex["summary"]), ex["summary"]
+        assert not _re.search(r"\b[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\b", ex["issue"]), ex["issue"]
 
 
 def test_json_output_format_includes_recovery_shaped_example():

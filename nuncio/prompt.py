@@ -62,14 +62,15 @@ _LEVEL_A_SYSTEM = _LEVEL_A_RULES + "\n" + _LEVEL_A_TEXT_FORMAT
 # reliably than they follow prose-only key-naming instructions.
 _JSON_OUTPUT_FORMAT = """\
 - Respond with ONLY a single JSON object with EXACTLY these keys:
-  "summary": one terse sentence, at most 12 words — what happened and since when (if known). The title already shows severity, host, and service — never repeat them; name only OTHER entities. Times as HH:MM (24h) only — no date, seconds, or offset. No markdown, no labels.
+  "issue": one terse sentence, at most 12 words — what happened and since when (if known). The title already shows severity, host, and service — never repeat them; name only OTHER entities. Times as HH:MM (24h) only — no date, seconds, or offset. No markdown, no labels.
   "likely_cause": the cause phrase ONLY, at most 20 words including evidence — do NOT begin with "Likely caused by" or "caused by" (that prefix is added automatically). End with terse evidence in parentheses, e.g. "(prior connection-slot alert 5m earlier)" — never "supported by", "within the same window", or "previous alerts for". Use "" if the evidence doesn't support a cause.
   "correlation": a genuinely related prior or concurrent alert on a DIFFERENT service/host, at most 12 words: which alert, how long ago, and a few-word why. Do NOT begin with "Related:" (that prefix is added automatically). A prior firing of THIS SAME alert is recurrence, not correlation — use null for that too (the title already shows recurrence). Use null when nothing is genuinely related. Never write the string "none".
   "checks": an array of 1 to 3 concrete read-only checks to run next, each at most 8 words, imperative. Use [] if none apply — checks MUST be [] for a recovery/OK or informational state.
+  "confidence": a number 0.0 to 1.0 — how confident you are in the likely_cause, given the evidence actually present. Use 0.0 to 0.4 when the evidence is thin or genuinely ambiguous ("insufficient signal"): it is better to say you're unsure than to invent a confident cause.
 - No other keys. No markdown anywhere in any value. Never state severity or urgency in any value. Total across all values under ~50 words — this is a phone push.
 - Examples of correctly formatted responses:
-  {"summary": "Interface 5 down-negotiated to 2.5 Gbit/s since 16:10.", "likely_cause": "cable or SFP fault (down-negotiation typically follows CRC errors)", "correlation": null, "checks": ["inspect cable/SFP on interface 5", "compare error counters", "check port logs for flapping"]}
-  {"summary": "Resolved at 18:23 after 5m.", "likely_cause": "", "correlation": "connection-slot alert on db-primary 5m earlier", "checks": []}"""
+  {"issue": "Interface 5 down-negotiated to 2.5 Gbit/s since 16:10.", "likely_cause": "cable or SFP fault (down-negotiation typically follows CRC errors)", "correlation": null, "checks": ["inspect cable/SFP on interface 5", "compare error counters", "check port logs for flapping"], "confidence": 0.8}
+  {"issue": "Resolved at 18:23 after 5m.", "likely_cause": "", "correlation": "connection-slot alert on db-primary 5m earlier", "checks": [], "confidence": 0.9}"""
 
 # Full-depth (Phase B) addendum to _JSON_OUTPUT_FORMAT: relaxes "correlation"
 # from a single string to an array of up to 3, when the richer full-depth
@@ -425,12 +426,12 @@ def build_full_triage_messages(alert, triage_sections):
     `_FULL_TRIAGE_EXCLUDE_EXTRAS`)."""
     parts = [
         (triage_sections or {}).get(name)
-        for name in ("history", "correlated", "recurrence")
+        for name in ("history", "correlated", "recurrence", "changes", "past_incidents")
     ]
     bundle = "\n\n".join(p for p in parts if p) or "(none)"
     safe = bundle.replace("«BUNDLE-START»", "[bundle-start]").replace("«BUNDLE-END»", "[bundle-end]")
     user = ("## Alert\n" + _alert_block(alert, exclude=_FULL_TRIAGE_EXCLUDE_EXTRAS)
-            + "\n\n## History/correlation context\n«BUNDLE-START»\n" + safe + "\n«BUNDLE-END»")
+            + "\n\n## History/correlation/changes context\n«BUNDLE-START»\n" + safe + "\n«BUNDLE-END»")
     return [
         {"role": "system", "content": _FULL_TRIAGE_SYSTEM},
         {"role": "user", "content": user},
@@ -503,18 +504,27 @@ def validate_structured(obj, max_chars=4000):
     recovery is a single valid line and must not be rejected for being
     short).
 
-    Rules: `obj` must be a dict; `summary` must be a string, 10-250 chars
-    after stripping; `likely_cause` must be a string if present (default
-    ""); `correlation` must be `None`, a string, or a list of strings if
-    present (default None); `checks` must be a list of strings if present
-    (default []); the re-serialized result must be <= `max_chars`."""
+    Rules: `obj` must be a dict; `issue` must be a string, 10-140 chars
+    after stripping (the S-track dual contract: a legacy `summary` key is
+    still accepted at 10-250 chars when `issue` is ABSENT -- an invalid
+    `issue` never falls back to `summary`); `likely_cause` must be a string
+    if present (default ""); `correlation` must be `None`, a string, or a
+    list of strings if present (default None); `checks` must be a list of
+    strings if present (default []); the re-serialized result must be <=
+    `max_chars`. The normalized result always carries the `summary` key
+    (holding the issue text) so renderers are untouched by the rename."""
     if not isinstance(obj, dict):
         return None
-    summary = obj.get("summary")
-    if not isinstance(summary, str):
+    if "issue" in obj:
+        issue = obj["issue"]
+        cap = 140
+    else:
+        issue = obj.get("summary")
+        cap = 250
+    if not isinstance(issue, str):
         return None
-    summary = summary.strip()
-    if not (10 <= len(summary) <= 250):
+    summary = issue.strip()
+    if not (10 <= len(summary) <= cap):
         return None
     likely_cause = obj.get("likely_cause", "")
     if likely_cause is None:
@@ -539,9 +549,18 @@ def validate_structured(obj, max_chars=4000):
         checks = []
     if not (isinstance(checks, list) and all(isinstance(x, str) for x in checks)):
         return None
+    confidence = obj.get("confidence", None)
+    if confidence is not None:
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= confidence <= 1.0):
+            return None
     result = {
         "summary": summary, "likely_cause": likely_cause,
         "correlation": correlation, "checks": checks,
+        "confidence": confidence,
     }
     try:
         if len(json.dumps(result)) > max_chars:
@@ -667,7 +686,24 @@ def render_structured(fields):
 
     if not extra_lines:
         return summary
-    return summary + "\n\n" + "\n".join(extra_lines)
+    rendered = summary + "\n\n" + "\n".join(extra_lines)
+    # C5: calibrated-confidence signal -- attached ONLY when the model
+    # attributed a cause (extra_lines non-empty), and never used to
+    # suppress anything (an annotation, not a gate). Sub-0.5 reads as
+    # "insufficient signal -- treat as hypothesis".
+    if likely_cause:
+        confidence = fields.get("confidence")
+        if confidence is not None:
+            try:
+                confidence = float(confidence)
+            except (TypeError, ValueError):
+                confidence = None
+            if confidence is not None:
+                if confidence < 0.5:
+                    rendered += "\n\nInsufficient signal — treat the cause as a hypothesis."
+                else:
+                    rendered += f"\n\nConfidence: {int(round(confidence * 100))}%."
+    return rendered
 
 
 # --- normalize_enrichment: strip leftover report-style formatting from the
