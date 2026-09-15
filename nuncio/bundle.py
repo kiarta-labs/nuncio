@@ -8,13 +8,17 @@ point of Level B — survives.
 
 # Order the sections appear in the bundle. 'history' (Phase B, full depth
 # only -- the wider 24h store-only lookback, see nuncio.collectors.collect_history)
-# sits right after 'correlated', the section it complements.
-_ORDER = ["container_state", "recent_logs", "metrics", "kernel", "correlated", "history", "recurrence"]
-# Order to truncate when over the cap (least important first). 'recurrence' is
-# LAST: it's a single line, so it survives even the tightest cap. 'history'
-# drops before 'correlated' (the fresher, narrower-window section) -- the
-# wider historical lookback is the first thing to go under pressure.
-_TRUNCATE_ORDER = ["recent_logs", "kernel", "container_state", "metrics", "history", "correlated", "recurrence"]
+# sits right after 'correlated', the section it complements. 'changes' (C2,
+# store-only change hints) sits after 'history', before the recurrence
+# one-liner that closes the bundle.
+_ORDER = ["container_state", "recent_logs", "metrics", "kernel", "correlated", "history", "changes", "past_incidents", "recurrence"]
+# Order to truncate when over the cap (least important first). 'changes' is
+# FIRST: additive context, the first thing to go under pressure.
+# 'recurrence' is LAST: it's a single line, so it survives even the
+# tightest cap. 'history' drops before 'correlated' (the fresher,
+# narrower-window section) -- the wider historical lookback is the first
+# thing to go under pressure.
+_TRUNCATE_ORDER = ["past_incidents", "changes", "recent_logs", "kernel", "container_state", "metrics", "history", "correlated", "recurrence"]
 # Log-shaped sections are newest-LAST -> cut the OLD head, keep the recent tail.
 _HEAD_CUT = {"recent_logs", "kernel", "container_state"}
 

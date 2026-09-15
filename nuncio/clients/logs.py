@@ -20,6 +20,7 @@ import time
 import urllib.parse
 
 from nuncio.clients.http import basic_or_bearer_auth, request_json
+from nuncio.model import real_host
 
 log = logging.getLogger("nuncio.clients.logs")
 
@@ -139,8 +140,14 @@ class OpenObserveClient:
     def query(self, host, unit=None, window_s=900):
         if not self._base_url:
             return []
+        # Q3: placeholder hosts ("-", empty, non-alnum) are missing hosts --
+        # real_host() is the codebase-wide guard for exactly this (see
+        # nuncio.model). Without it a "-" host adds a str_match(field,'-')
+        # clause matching nearly every line, drowning ranking in garbage.
+        # Unit-only queries then run on the unit clause alone, same as a
+        # genuinely missing host.
         try:
-            return self._query(host, unit, window_s)
+            return self._query(real_host(host), unit, window_s)
         except Exception as e:
             log.warning("openobserve log query failed: %r", e)
             return []
@@ -204,7 +211,9 @@ class LokiClient:
         self._transport = transport or request_json
 
     def query(self, host, unit=None, window_s=900):
-        if not self._base_url or not host:
+        # Q3: same placeholder guard as OpenObserve above -- "-" must behave
+        # exactly like a missing host (selector requires a real host).
+        if not self._base_url or not real_host(host):
             return []
         try:
             return self._query(host, unit, window_s)

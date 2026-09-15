@@ -869,6 +869,35 @@ def test_garnish_guidance_is_normalized_before_append(store):
     assert "Common cause: X. Standard fix: Y." in result
 
 
+def test_garnish_skipped_on_recovery_and_info_legs(store):
+    # Q1: ok/info dispositions get no knowledge garnish -- a resolved or
+    # informational alert must not carry a problem-framed generic essay.
+    # The gate fires before any knowledge-plane call (zero calls), and the
+    # enrichment passes through byte-identical.
+    for severity in ("ok", "info"):
+        know = FakeKnowledgeLLM("Common cause: X. Standard fix: Y.")
+        eng = make_engine_with_knowledge(store, FakeLLM([]), FakeDelivery(), FakeClock(), know,
+                                         knowledge_enabled=True, redundant=False, depth="full")
+        alert = dict(ALERT, category="container", severity=severity)
+        deadline = Deadline(45.0, clock=FakeClock())
+        result = eng._garnish_with_knowledge(alert, "original enrichment", deadline, depth="full")
+        assert result == "original enrichment"
+        assert know.calls == []
+
+
+def test_garnish_still_fires_on_problem_legs(store):
+    # Q1 companion: warning/critical/unknown dispositions are unaffected.
+    for severity in ("warning", "critical", "unknown"):
+        know = FakeKnowledgeLLM("Common cause: X. Standard fix: Y.")
+        eng = make_engine_with_knowledge(store, FakeLLM([]), FakeDelivery(), FakeClock(), know,
+                                         knowledge_enabled=True, redundant=False, depth="full")
+        alert = dict(ALERT, category="container", severity=severity)
+        deadline = Deadline(45.0, clock=FakeClock())
+        result = eng._garnish_with_knowledge(alert, "original enrichment", deadline, depth="full")
+        assert "General guidance" in result
+        assert len(know.calls) == 1
+
+
 # =====================================================================
 # Batch B: per-section redaction feeds BOTH the stored bundle and the
 # envelope's evidence sections (never neither, never just one).
@@ -2374,3 +2403,43 @@ def test_deliver_enriched_belt_fails_open_on_store_get_status_exception(store, m
 
     outcome = eng.process("k1", ALERT, RAW)
     assert outcome == "enriched"  # fail OPEN -- delivered normally despite the store hiccup
+
+
+# --- S-track: deterministic identity + detail header ---
+
+def test_enriched_headline_uses_display_name_not_placeholder_host(store):
+    store.persist("k1", RAW)
+    llm = FakeLLM([("ok", VALID)])
+    dlv = FakeDelivery()
+    eng = make_engine(store, llm, dlv, FakeClock())
+    alert = dict(ALERT, host="-", service="db-primary")
+    assert eng.process("k1", alert, RAW) == "enriched"
+    entity_side = dlv.sent[0].headline.split("—")[0]
+    assert entity_side.strip().endswith("db-primary")  # no "-/" entity
+    assert "-/" not in entity_side
+
+
+def test_enriched_detail_carries_severity_affected_header(store):
+    store.persist("k1", RAW)
+    llm = FakeLLM([("ok", VALID)])
+    dlv = FakeDelivery()
+    eng = make_engine(store, llm, dlv, FakeClock())
+    alert = dict(ALERT, severity="critical")
+    assert eng.process("k1", alert, RAW) == "enriched"
+    detail = dlv.sent[0].detail
+    assert detail.startswith("Severity: Critical\nAffected: host01/db-primary\n\n")
+    assert dlv.sent[0].summary != "" and "Severity:" not in dlv.sent[0].summary
+
+
+def test_ok_leg_detail_is_stub_without_cause_or_garnish(store):
+    store.persist("k1", RAW)
+    llm = FakeLLM([("ok", VALID)])
+    dlv = FakeDelivery()
+    eng = make_engine(store, llm, dlv, FakeClock())
+    alert = dict(ALERT, severity="ok")
+    assert eng.process("k1", alert, RAW) == "enriched"
+    detail = dlv.sent[0].detail
+    assert detail.startswith("Severity: OK\nAffected: host01/db-primary\n\n")
+    assert "Likely caused by" not in detail
+    assert "Next:" not in detail
+    assert "General guidance" not in detail

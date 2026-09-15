@@ -1240,9 +1240,14 @@ def test_render_dashboard_html_supports_dark_and_light_theme(store):
 # the dashboard) moved 18px -> 22px as part of the prominence bump -- same
 # character count, so the LENGTH baseline is untouched, but the hash moves.
 # dashboard.py itself is still untouched; only the shared root token did.
+#
+# P2 providers update: the private-plane pill now renders `model@provider`
+# (+ ` (trusted)` marker) from stats planes (dashboard.py strip JS). Length
+# and hash re-pinned with the pane landed (34,509 bytes); the pill degrades
+# to the old text when provider/trusted are absent.
 
-_DASHBOARD_BASELINE_LEN = 34386
-_DASHBOARD_BASELINE_SHA256 = "044bc04c43d319d88825432145e1036c242968389c3ed35d6c084b9d5924fbc1"
+_DASHBOARD_BASELINE_LEN = 34509
+_DASHBOARD_BASELINE_SHA256 = "f75322b935af4ac841fda6c99228545b9aaaf07fa70e4cc41bcb257fc02323ef"
 
 
 def test_render_dashboard_html_byte_identical_to_pre_phase_c_baseline(store):

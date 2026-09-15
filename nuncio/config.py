@@ -11,30 +11,37 @@ config is logged (secrets masked BY THE REDACTOR ITSELF — dogfooding) and
 served at `GET /config.json`.
 """
 import importlib
+import ipaddress
 import json
 import logging
 import os
+import re
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
 from nuncio import delivery as delivery_ring
 from nuncio import sources
+from nuncio import topology
 from nuncio.clients import CollectorHealth, NullClient
 from nuncio.clients.containers import DockerClient
 from nuncio.clients.logs import LokiClient, OpenObserveClient
 from nuncio.clients.metrics import CheckmkClient, PrometheusClient
 from nuncio.collectors import (
+    collect_changes,
     collect_container_state,
     collect_correlated,
     collect_history,
     collect_kernel,
     collect_metrics,
+    collect_past_incidents,
     collect_recent_logs,
     collect_recurrence,
 )
 from nuncio.assist import AssistClient, AssistTrack
+from nuncio.circuit import CircuitBreaker
 from nuncio.engine import Engine, _FULL_POST_GATHER_RESERVE_S
 from nuncio.gatherer import Gatherer
 from nuncio.llm import LLMClient, _chat_completions_url
@@ -69,11 +76,14 @@ _SCHEMA = {
     "NUNCIO_LLM_CB_WINDOW_S": (300, int),
     "NUNCIO_LLM_CB_COOLDOWN_S": (60, int),
     "NUNCIO_LLM_HEADERS": ("{}", str),
+    "NUNCIO_PROVIDERS_JSON": ("{}", str),
+    "NUNCIO_LLM_PROVIDER": ("", str),
     "NUNCIO_ENRICH_FORMAT": ("auto", str),
     "NUNCIO_KNOWLEDGE_ENABLED": ("true", str),
     "NUNCIO_KNOWLEDGE_URL": ("", str),
     "NUNCIO_KNOWLEDGE_KEY": ("", str),
     "NUNCIO_KNOWLEDGE_MODEL": ("", str),
+    "NUNCIO_KNOWLEDGE_PROVIDER": ("", str),
     "NUNCIO_ASSIST_ENABLED": ("false", str),
     "NUNCIO_ASSIST_URL": ("", str),
     "NUNCIO_ASSIST_KEY": ("", str),
@@ -82,6 +92,7 @@ _SCHEMA = {
     "NUNCIO_ASSIST_CONFIRM_EXTERNAL_OK": ("false", str),
     "NUNCIO_ASSIST_SEVERITIES": ("critical", str),
     "NUNCIO_ASSIST_TIMEOUT_S": (60.0, float),
+    "NUNCIO_ASSIST_PROVIDER": ("", str),
     "NUNCIO_DELIVERY": ("stdout", str),
     "NUNCIO_APPRISE_URL": ("", str),
     "NUNCIO_NTFY_URL": ("", str),
@@ -114,6 +125,7 @@ _SCHEMA = {
     "NUNCIO_INGEST_TOKEN": ("", str),
     "NUNCIO_DEFAULT_SOURCE": ("generic", str),
     "NUNCIO_EXTRA_SOURCES": ("", str),
+    "NUNCIO_DIGEST_WINDOW_S": (0, int),
     "NUNCIO_BUDGET_S": (30.0, float),
     "NUNCIO_ENRICH_DEPTH": ("full", str),
     "NUNCIO_FULL_BUDGET_S": (60.0, float),
@@ -210,9 +222,13 @@ UI_EDITABLE = {
                                     group="llm", label="Circuit-breaker window (s)",
                                     help="Sliding window over which retryable LLM failures are counted."),
     "NUNCIO_LLM_CB_COOLDOWN_S": _spec("NUNCIO_LLM_CB_COOLDOWN_S", category="live", type="int", min=1, max=86400,
-                                      group="llm", label="Circuit-breaker cooldown (s)",
-                                      help="Time the circuit stays open (enrichment fails fast to raw) "
-                                           "before one half-open probe call is allowed."),
+                                     group="llm", label="Circuit-breaker cooldown (s)",
+                                     help="Time the circuit stays open (enrichment fails fast to raw) "
+                                          "before one half-open probe call is allowed."),
+    "NUNCIO_LLM_PROVIDER": _spec("NUNCIO_LLM_PROVIDER", category="live", type="str", group="llm",
+                                 label="Provider",
+                                 help="Provider id from NUNCIO_PROVIDERS_JSON for the private plane. "
+                                      "Empty = the legacy NUNCIO_LLM_URL/_KEY/_MODEL trio."),
 
     # --- Knowledge plane: on/off + alias only; the endpoint is a NEVER-key.
     # Enabled by default (Phase C) -- inherits the enrichment (private) plane's
@@ -230,11 +246,15 @@ UI_EDITABLE = {
                                            "call already run on the same model -- it meaningfully fires only in "
                                            "low depth, or when pointed at a distinct knowledge endpoint/model."),
     "NUNCIO_KNOWLEDGE_MODEL": _spec("NUNCIO_KNOWLEDGE_MODEL", category="live", type="str", group="knowledge",
-                                    label="Model",
-                                    help="Alias sent to the knowledge-plane endpoint. Empty = inherit the "
-                                         "enrichment model (NUNCIO_LLM_MODEL). Knowledge-plane calls are "
-                                         "anonymised: only a generic, identifier-free problem-class description "
-                                         "is ever sent — never alert text, hostnames, or any identifier."),
+                                     label="Model",
+                                     help="Alias sent to the knowledge-plane endpoint. Empty = inherit the "
+                                          "enrichment model (NUNCIO_LLM_MODEL). Knowledge-plane calls are "
+                                          "anonymised: only a generic, identifier-free problem-class description "
+                                          "is ever sent — never alert text, hostnames, or any identifier."),
+    "NUNCIO_KNOWLEDGE_PROVIDER": _spec("NUNCIO_KNOWLEDGE_PROVIDER", category="live", type="str", group="knowledge",
+                                       label="Provider",
+                                       help="Provider id from NUNCIO_PROVIDERS_JSON for the knowledge plane. "
+                                            "Empty = inherit the private plane (endpoint/model/key)."),
 
     # --- Assist plane: an optional, out-of-band, single hosted-LLM call made
     # STRICTLY AFTER the primary alert has already been delivered (own 60s
@@ -260,9 +280,13 @@ UI_EDITABLE = {
                                            "alerts at one of these severities are ever deferred to the assist "
                                            "plane."),
     "NUNCIO_ASSIST_TIMEOUT_S": _spec("NUNCIO_ASSIST_TIMEOUT_S", category="live", type="float", min=5, max=600,
-                                     group="assist", label="Assist call budget (s)",
-                                     help="The assist plane's OWN post-delivery budget -- entirely separate "
-                                          "from the 30s alert deadline, which the assist call never runs inside."),
+                                      group="assist", label="Assist call budget (s)",
+                                      help="The assist plane's OWN post-delivery budget -- entirely separate "
+                                           "from the 30s alert deadline, which the assist call never runs inside."),
+    "NUNCIO_ASSIST_PROVIDER": _spec("NUNCIO_ASSIST_PROVIDER", category="live", type="str", group="assist",
+                                    label="Provider",
+                                    help="Provider id from NUNCIO_PROVIDERS_JSON for the assist plane. "
+                                         "Empty = the legacy NUNCIO_ASSIST_URL/_KEY/_MODEL trio."),
 
     # --- Delivery ---
     "NUNCIO_DELIVERY": _spec("NUNCIO_DELIVERY", category="live", type="str", confirm=True, group="delivery",
@@ -434,6 +458,13 @@ UI_EDITABLE = {
                                       "explicit environment-variable decision."),
     "NUNCIO_DEFAULT_SOURCE": _spec("NUNCIO_DEFAULT_SOURCE", category="live", type="str", group="ingest",
                                    label="Default source adapter"),
+    "NUNCIO_DIGEST_WINDOW_S": _spec("NUNCIO_DIGEST_WINDOW_S", category="live", type="int", min=0, max=86400,
+                                    group="ingest", label="Digest window (s)",
+                                    help="Generic info/ok notices sharing a (source, severity, host) "
+                                         "group inside this window collapse into one enriched digest "
+                                         "instead of N enrichments; 0 (default) disables. The first "
+                                         "notice always goes out immediately. Opt-in: enabling changes "
+                                         "delivery semantics (repeats become one digest)."),
 
     # --- Storage & retention ---
     "NUNCIO_RETENTION_DAYS": _spec("NUNCIO_RETENTION_DAYS", category="live", type="int", min=1, max=3650,
@@ -463,6 +494,7 @@ NEVER_REASONS = {
     "NUNCIO_LLM_URL": "Env-only: a settable URL could repoint the private plane.",
     "NUNCIO_LLM_KEY": "Env-only: private-plane credential.",
     "NUNCIO_LLM_HEADERS": "Env-only: free-form headers could re-route the private plane.",
+    "NUNCIO_PROVIDERS_JSON": "Env-only: endpoints, headers, key refs. Selectors are live-editable; the registry is not.",
     "NUNCIO_KNOWLEDGE_URL": "Env-only endpoint. Only anonymised problem-class strings are ever sent to it "
                             "— never alert text or identifiers.",
     "NUNCIO_KNOWLEDGE_KEY": "Env-only: knowledge-plane credential.",
@@ -495,6 +527,232 @@ SECRET_KEYS = frozenset(
     "NUNCIO_LLM_KEY", "NUNCIO_KNOWLEDGE_KEY", "NUNCIO_ASSIST_KEY",
     "NUNCIO_ADMIN_TOKEN", "NUNCIO_LLM_HEADERS", "NUNCIO_WEBHOOK_HEADERS",
 }
+
+
+# --- provider registry (P0): named LLM endpoints selectable per plane ---
+#
+# NUNCIO_PROVIDERS_JSON maps a short provider id to its wire target. Secrets
+# NEVER live in this blob: `api_key_ref` names an environment variable whose
+# VALUE is resolved from the boot environment into memory only (never into
+# settings-overrides.json, never into any GET payload -- see
+# _masked_providers_view). An absent ref is legal (unauthenticated endpoint,
+# the local-model default); a PRESENT-but-unresolvable ref against a
+# non-local endpoint is a ConfigError (a typo must never silently downgrade
+# to unauthenticated calls at a hosted endpoint).
+#
+# P1: `trusted` is parsed and honored (see the dual-track pipeline in
+# nuncio.engine + the per-alert capture in nuncio.server). Trust is
+# env-only/restart (the registry is NEVER): there is deliberately no
+# settings-screen toggle -- flipping trust redefines the data boundary.
+
+_PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_API_KEY_REF_RE = re.compile(r"^[A-Z0-9_]{1,128}$")
+_MAX_PROVIDERS = 16  # metric-cardinality bound, enforced at config time
+_PROVIDER_FIELDS = frozenset({"base_url", "model", "timeout_s", "headers", "api_key_ref", "trusted"})
+
+
+def _is_local_base_url(url):
+    """True for loopback/private-literal and localhost URLs. DNS names that
+    do not parse as IPs are NOT local -- a named service could resolve
+    anywhere, so fail-closed treats it as remote for key validation."""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").strip().lower().rstrip(".")
+    except Exception:
+        return False
+    if host in ("localhost",):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private
+
+
+def _parse_providers_registry(raw):
+    """Parse NUNCIO_PROVIDERS_JSON into {id: {base_url, model, timeout_s,
+    headers, api_key_ref, trusted}}. Raises ConfigError on any problem --
+    unknown fields included (typo catch). No secret values are read here,
+    only the reference NAMES (resolution happens in Settings.__init__
+    against the boot environment)."""
+    if not (raw or "").strip():
+        return {}
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise ConfigError(f"NUNCIO_PROVIDERS_JSON is not valid JSON: {e}")
+    if not isinstance(doc, dict):
+        raise ConfigError("NUNCIO_PROVIDERS_JSON must be a JSON object of provider-id -> settings")
+    if len(doc) > _MAX_PROVIDERS:
+        raise ConfigError(
+            f"NUNCIO_PROVIDERS_JSON holds {len(doc)} providers; at most {_MAX_PROVIDERS} "
+            "are allowed (per-provider metric cardinality)"
+        )
+    out = {}
+    for pid, entry in doc.items():
+        where = f"NUNCIO_PROVIDERS_JSON[{pid!r}]"
+        if not isinstance(pid, str) or not _PROVIDER_ID_RE.match(pid):
+            raise ConfigError(f"{where}: provider id must match [A-Za-z0-9][A-Za-z0-9_-]{{0,63}}")
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where} must be an object")
+        unknown = set(entry) - _PROVIDER_FIELDS
+        if unknown:
+            raise ConfigError(f"{where} has unknown field(s) {sorted(unknown)} (typo?)")
+        base_url = str(entry.get("base_url") or "").strip()
+        if not base_url:
+            raise ConfigError(f"{where} requires base_url")
+        try:
+            parts = urllib.parse.urlsplit(base_url)
+        except Exception:
+            parts = None
+        if parts is None or parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ConfigError(f"{where}: base_url must be an http(s) URL with a host")
+        timeout_s = entry.get("timeout_s")
+        if timeout_s is not None:
+            try:
+                timeout_s = float(timeout_s)
+            except (TypeError, ValueError):
+                raise ConfigError(f"{where}: timeout_s must be a number of seconds")
+            if timeout_s <= 0:
+                raise ConfigError(f"{where}: timeout_s must be positive")
+        headers = entry.get("headers", {})
+        if not isinstance(headers, dict) or any(
+            not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()
+        ):
+            raise ConfigError(f"{where}: headers must be an object of string -> string")
+        ref = str(entry.get("api_key_ref") or "").strip()
+        if ref and not _API_KEY_REF_RE.match(ref):
+            raise ConfigError(f"{where}: api_key_ref must match [A-Z0-9_]{{1,128}}")
+        trusted = entry.get("trusted", False)
+        if not isinstance(trusted, bool):
+            raise ConfigError(f"{where}: trusted must be true/false, not {trusted!r}")
+        out[pid] = {
+            "base_url": base_url,
+            "model": str(entry.get("model") or ""),
+            "timeout_s": timeout_s,
+            "headers": dict(headers),
+            "api_key_ref": ref,
+            "trusted": trusted,
+        }
+    return out
+
+def _resolve_plane(settings, selector, legacy_url, legacy_key, legacy_model, legacy_timeout, legacy_headers):
+    """Resolve one plane's effective (url, key, model, timeout, headers).
+    Empty selector = the legacy env trio, verbatim. A set selector must name
+    a registry entry (validated in Settings.__init__); entry fields win, with
+    the legacy model/timeout/headers as fallback for fields the entry leaves
+    empty (so a registry entry only needs base_url to be useful)."""
+    if not selector:
+        return legacy_url, legacy_key, legacy_model, legacy_timeout, legacy_headers
+    pentry = settings.provider_registry[selector]
+    # Headers deliberately do NOT fall back to the legacy value: extra
+    # headers can carry credentials (e.g. a gateway-specific auth header),
+    # and silently sending the legacy endpoint's headers to a different
+    # endpoint would leak and/or break. An entry that needs headers states
+    # them explicitly. (Model/timeout fall back safely -- neither is a
+    # credential.)
+    return (
+        pentry["base_url"],
+        settings.provider_secrets.get(selector, ""),
+        pentry["model"] or legacy_model,
+        pentry["timeout_s"] or legacy_timeout,
+        pentry["headers"] or {},
+    )
+
+
+def _masked_providers_view(settings):
+    """Structured masked view of the registry for /config.json and
+    GET /providers.json: ids, redacted base URLs, models, ref NAMES, and key
+    presence -- never secret values (they live only in provider_secrets, in
+    memory, and are never serialized here)."""
+    view = {}
+    for pid, pentry in (getattr(settings, "provider_registry", None) or {}).items():
+        view[pid] = {
+            "base_url": redact(pentry["base_url"])[0],
+            "model": pentry["model"],
+            "api_key_ref": pentry["api_key_ref"] or None,
+            "key": "«set»" if getattr(settings, "provider_secrets", {}).get(pid) else "«unset»",
+            "trusted": bool(pentry.get("trusted", False)),
+            "source": "registry",
+        }
+    return view
+
+
+def providers_list_view(settings):
+    """Public registry listing: the masked registry view, or -- when no
+    registry is configured -- pseudo-entries seeded from the legacy env
+    trio(s) so the providers pane is useful on legacy installs with zero
+    migration. Same masking discipline as _masked_providers_view."""
+    if settings is None:
+        return []
+    registry = getattr(settings, "provider_registry", None) or {}
+    if registry:
+        return [{"id": pid, **info} for pid, info in _masked_providers_view(settings).items()]
+    seeded = [{
+        "id": "private",
+        "base_url": redact(settings.NUNCIO_LLM_URL or "")[0],
+        "model": settings.NUNCIO_LLM_MODEL,
+        "api_key_ref": None,
+        "key": "«set»" if settings.NUNCIO_LLM_KEY else "«unset»",
+        "trusted": False,
+        "source": "legacy",
+    }]
+    if settings.NUNCIO_KNOWLEDGE_URL:
+        seeded.append({
+            "id": "knowledge",
+            "base_url": redact(settings.NUNCIO_KNOWLEDGE_URL)[0],
+            "model": settings.NUNCIO_KNOWLEDGE_MODEL,
+            "api_key_ref": None,
+            "key": "«set»" if settings.NUNCIO_KNOWLEDGE_KEY else "«unset»",
+            "trusted": False,
+            "source": "legacy",
+        })
+    if settings.NUNCIO_ASSIST_URL:
+        seeded.append({
+            "id": "assist",
+            "base_url": redact(settings.NUNCIO_ASSIST_URL)[0],
+            "model": settings.NUNCIO_ASSIST_MODEL,
+            "api_key_ref": None,
+            "key": "«set»" if settings.NUNCIO_ASSIST_KEY else "«unset»",
+            "trusted": False,
+            "source": "legacy",
+        })
+    return seeded
+
+
+def resolve_provider_for_test(settings, pid):
+    """(base_url, key, model, timeout_s, headers) for
+    GET /providers/{id}/test, or None for an unknown id. Accepts registry
+    ids and -- on any install -- the plane pseudo-ids private/knowledge/
+    assist, resolved from the planes' already-computed effective triples
+    (single source of truth, same values the engine actually calls),
+    INCLUDING entry headers (a provider whose auth lives in a header must
+    probe the same way it runs). Secrets stay in memory; callers must never
+    serialize the key."""
+    if settings is None:
+        return None
+    registry = getattr(settings, "provider_registry", None) or {}
+    if pid in registry:
+        pentry = registry[pid]
+        return (
+            pentry["base_url"],
+            getattr(settings, "provider_secrets", {}).get(pid, ""),
+            pentry["model"] or settings.private_model,
+            pentry["timeout_s"] or settings.NUNCIO_LLM_TIMEOUT_S,
+            dict(pentry["headers"] or {}),
+        )
+    if pid == "private":
+        return (settings.private_url, settings.private_key,
+                settings.private_model, settings.private_timeout_s,
+                settings.private_headers)
+    if pid == "knowledge" and settings.NUNCIO_KNOWLEDGE_ENABLED:
+        return (settings.knowledge_url, settings.knowledge_key,
+                settings.knowledge_model, settings.knowledge_timeout_s,
+                getattr(settings, "_knowledge_headers", {}))
+    if pid == "assist" and settings.assist_url:
+        return (settings.assist_url, settings.assist_key,
+                settings.assist_model, settings.assist_timeout_s,
+                getattr(settings, "_assist_headers", {}))
+    return None
 
 
 # --- pipeline stage: which of the five interactive-pipeline stages owns each
@@ -539,6 +797,7 @@ _NEVER_STAGE = {
     "NUNCIO_LLM_URL": "enrich",
     "NUNCIO_LLM_KEY": "enrich",
     "NUNCIO_LLM_HEADERS": "enrich",
+    "NUNCIO_PROVIDERS_JSON": "enrich",
     "NUNCIO_KNOWLEDGE_URL": "enrich",
     "NUNCIO_KNOWLEDGE_KEY": "enrich",
     "NUNCIO_ASSIST_URL": "enrich",
@@ -740,6 +999,52 @@ class Settings:
                 "NUNCIO_LLM_URL is required and is the ONLY mandatory Nuncio "
                 "setting (example: NUNCIO_LLM_URL=http://ollama:11434)"
             )
+        # --- provider registry (P0), part 1: parse + secrets + selector
+        # validation. Runs this early (before the assist-enabled gate below)
+        # so a plane whose URL comes from a registry entry -- rather than
+        # its legacy env var -- passes the "URL required" gates. Per-plane
+        # triple resolution happens later (it needs llm_headers, parsed
+        # further down); see the second block before `self.yaml`.
+        self.provider_registry = _parse_providers_registry(self.NUNCIO_PROVIDERS_JSON or "{}")
+        self.provider_secrets = {}
+        for pid, pentry in self.provider_registry.items():
+            ref = pentry["api_key_ref"]
+            secret = ""
+            if ref:
+                secret = str(self._env.get(ref) or "")
+                if not secret and not _is_local_base_url(pentry["base_url"]):
+                    raise ConfigError(
+                        f"provider {pid!r}: api_key_ref {ref!r} is set but empty/missing in the "
+                        "environment while the endpoint is not local -- refusing to run "
+                        "unauthenticated against a remote endpoint (typo in the ref name?)"
+                    )
+                if not secret:
+                    log.warning(
+                        "provider %r: api_key_ref %r is empty -- using unauthenticated access "
+                        "(local endpoint only)", pid, ref,
+                    )
+            self.provider_secrets[pid] = secret
+            # P1: a trusted flag on a non-local endpoint means raw alert text
+            # will leave the network. That is an allowed, explicit operator
+            # choice -- but it must be impossible to do accidentally, so it
+            # gets a startup WARNING naming the provider (not a ConfigError:
+            # blocking it would forbid deliberately trusting a hosted model).
+            if pentry.get("trusted") and not _is_local_base_url(pentry["base_url"]):
+                # The URL is redacted before logging: base URLs may embed
+                # basic-auth credentials, which must never reach the log.
+                log.warning(
+                    "provider %r is flagged trusted but its endpoint %r is not local -- "
+                    "raw (unredacted) alert text will be sent there",
+                    pid, redact(pentry["base_url"])[0],
+                )
+        for sel_name in ("NUNCIO_LLM_PROVIDER", "NUNCIO_KNOWLEDGE_PROVIDER", "NUNCIO_ASSIST_PROVIDER"):
+            sel = str(getattr(self, sel_name) or "").strip()
+            if sel and sel not in self.provider_registry:
+                raise ConfigError(
+                    f"{sel_name}={sel!r} names no provider in NUNCIO_PROVIDERS_JSON "
+                    f"(available: {sorted(self.provider_registry) or 'none -- registry is empty'})"
+                )
+            setattr(self, sel_name, sel)
         self.NUNCIO_KNOWLEDGE_ENABLED = str(self.NUNCIO_KNOWLEDGE_ENABLED).strip().lower() in _TRUTHY
         # Phase C: the knowledge plane INHERITS the enrichment (private)
         # plane's endpoint/model/key whenever the corresponding
@@ -782,8 +1087,8 @@ class Settings:
         # one, so a single typo can never leak scrubbed-real alert content to
         # an external endpoint. ---
         self.NUNCIO_ASSIST_ENABLED = str(self.NUNCIO_ASSIST_ENABLED).strip().lower() in _TRUTHY
-        if self.NUNCIO_ASSIST_ENABLED and not self.NUNCIO_ASSIST_URL:
-            raise ConfigError("NUNCIO_ASSIST_ENABLED=true requires NUNCIO_ASSIST_URL")
+        if self.NUNCIO_ASSIST_ENABLED and not self.NUNCIO_ASSIST_URL and not self.NUNCIO_ASSIST_PROVIDER:
+            raise ConfigError("NUNCIO_ASSIST_ENABLED=true requires NUNCIO_ASSIST_URL (or NUNCIO_ASSIST_PROVIDER)")
         self.NUNCIO_ASSIST_CONFIRM_EXTERNAL_OK = str(self.NUNCIO_ASSIST_CONFIRM_EXTERNAL_OK).strip().lower() in _TRUTHY
         _valid_postures = ("generic", "scrubbed-real")
         if self.NUNCIO_ASSIST_DATA_POSTURE not in _valid_postures:
@@ -927,6 +1232,48 @@ class Settings:
                 )
         self.delivery_verbosity = raw_verbosity
 
+        # --- provider registry (P0), part 2: per-plane triple resolution.
+        # Empty registry + empty selectors = the legacy env trios, verbatim,
+        # so a registry-unaware install behaves byte-identically to before. ---
+        (self.private_url, self.private_key, self.private_model,
+         self.private_timeout_s, self.private_headers) = _resolve_plane(
+            self, self.NUNCIO_LLM_PROVIDER,
+            self.NUNCIO_LLM_URL, self.NUNCIO_LLM_KEY, self.NUNCIO_LLM_MODEL,
+            self.NUNCIO_LLM_TIMEOUT_S, self.llm_headers,
+        )
+        # P1: per-alert trust is captured at ingest from this flag (see
+        # nuncio.server.App.ingest) -- never re-resolved mid-pipeline.
+        self.private_trusted = bool(
+            self.NUNCIO_LLM_PROVIDER
+            and self.provider_registry.get(self.NUNCIO_LLM_PROVIDER, {}).get("trusted", False)
+        )
+        if self.NUNCIO_KNOWLEDGE_PROVIDER:
+            _kp = self.provider_registry[self.NUNCIO_KNOWLEDGE_PROVIDER]
+            self.knowledge_url = _kp["base_url"]
+            self.knowledge_key = self.provider_secrets.get(self.NUNCIO_KNOWLEDGE_PROVIDER, "")
+            # An explicit provider with an empty model falls back to the
+            # private plane's effective model (an empty alias would be sent
+            # verbatim to the endpoint, which no backend accepts).
+            self.knowledge_model = _kp["model"] or self.private_model
+            self.knowledge_timeout_s = _kp["timeout_s"] or self.NUNCIO_LLM_TIMEOUT_S
+            self._knowledge_headers = dict(_kp["headers"])
+        else:
+            self.knowledge_timeout_s = self.NUNCIO_LLM_TIMEOUT_S
+            self._knowledge_headers = {}
+        if self.NUNCIO_ASSIST_PROVIDER:
+            _ap = self.provider_registry[self.NUNCIO_ASSIST_PROVIDER]
+            self.assist_url = _ap["base_url"]
+            self.assist_key = self.provider_secrets.get(self.NUNCIO_ASSIST_PROVIDER, "")
+            self.assist_model = _ap["model"] or self.NUNCIO_ASSIST_MODEL
+            self.assist_timeout_s = _ap["timeout_s"] or self.NUNCIO_ASSIST_TIMEOUT_S
+            self._assist_headers = dict(_ap["headers"])
+        else:
+            self.assist_url = self.NUNCIO_ASSIST_URL
+            self.assist_key = self.NUNCIO_ASSIST_KEY
+            self.assist_model = self.NUNCIO_ASSIST_MODEL
+            self.assist_timeout_s = self.NUNCIO_ASSIST_TIMEOUT_S
+            self._assist_headers = {}
+
         self.yaml = {}
         if self.NUNCIO_CONFIG:
             doc = _load_json_config_file(self.NUNCIO_CONFIG)
@@ -974,7 +1321,8 @@ class SettingsValidationError(Exception):
 # the LLM client's).
 _LLM_ROUTER_KEYS = frozenset({
     "NUNCIO_LLM_MODEL", "NUNCIO_LLM_TIMEOUT_S", "NUNCIO_LLM_MAX_TOKENS",
-    "NUNCIO_KNOWLEDGE_ENABLED", "NUNCIO_KNOWLEDGE_MODEL",
+    "NUNCIO_LLM_PROVIDER", "NUNCIO_KNOWLEDGE_ENABLED", "NUNCIO_KNOWLEDGE_MODEL",
+    "NUNCIO_KNOWLEDGE_PROVIDER",
     # NUNCIO_ENRICH_FORMAT: a text<->auto flip must rebuild the LLMClient so
     # a stale `_json_object_supported` capability-cache value (learned
     # against a previous endpoint/mode) can never leak into the new one --
@@ -983,6 +1331,7 @@ _LLM_ROUTER_KEYS = frozenset({
 })
 _ASSIST_KEYS = frozenset({
     "NUNCIO_ASSIST_ENABLED", "NUNCIO_ASSIST_MODEL", "NUNCIO_ASSIST_SEVERITIES", "NUNCIO_ASSIST_TIMEOUT_S",
+    "NUNCIO_ASSIST_PROVIDER",
 })
 _DELIVERY_KEYS = frozenset({
     "NUNCIO_DELIVERY", "NUNCIO_APPRISE_URL", "NUNCIO_NTFY_URL", "NUNCIO_NTFY_TOPIC", "NUNCIO_NTFY_TOKEN",
@@ -1119,8 +1468,8 @@ def apply_changes(app, set_map, reset_list=None):
         try:
             if _touches(live_changed, _LLM_ROUTER_KEYS):
                 rebuilt["llm"] = LLMClient(
-                    candidate.NUNCIO_LLM_URL, candidate.NUNCIO_LLM_KEY, candidate.NUNCIO_LLM_MODEL,
-                    timeout=candidate.NUNCIO_LLM_TIMEOUT_S, extra_headers=candidate.llm_headers,
+                    candidate.private_url, candidate.private_key, candidate.private_model,
+                    timeout=candidate.private_timeout_s, extra_headers=candidate.private_headers,
                 )
                 rebuilt["router"] = build_router(candidate)
                 rebuilt["knowledge_llm"] = build_knowledge_llm(candidate)
@@ -1183,15 +1532,52 @@ def apply_changes(app, set_map, reset_list=None):
             set_ui_extra_rules(candidate.NUNCIO_REDACT_EXTRA_RULES)
         if "allow_keywords" in rebuilt:
             set_allow_keywords(candidate.NUNCIO_REDACT_ALLOW_KEYWORDS)
-        if "NUNCIO_LLM_TIMEOUT_S" in live_changed:
-            engine.per_attempt_s = candidate.NUNCIO_LLM_TIMEOUT_S
+        if "NUNCIO_LLM_TIMEOUT_S" in live_changed or "NUNCIO_LLM_PROVIDER" in live_changed:
+            # per_attempt_s tracks the RESOLVED private-plane timeout (a
+            # registry entry may carry its own timeout_s).
+            engine.per_attempt_s = candidate.private_timeout_s
+        if "NUNCIO_LLM_PROVIDER" in live_changed:
+            # P1: selectors are live even though the registry is env-only --
+            # a selector flip can move a plane between trusted/untrusted
+            # providers, so the capture-time flags refresh here too.
+            # P2: the funnel follows via engine.provider_id (see
+            # Engine._active_breaker); the legacy metrics series follows the
+            # active breaker so existing rules keep working.
+            app.private_trusted = bool(
+                candidate.NUNCIO_LLM_PROVIDER
+                and candidate.provider_registry.get(
+                    candidate.NUNCIO_LLM_PROVIDER, {}).get("trusted", False)
+            )
+            engine.provider_id = candidate.NUNCIO_LLM_PROVIDER or None
+            if hasattr(app.metrics, "breaker"):
+                app.metrics.breaker = engine._active_breaker()
+        if "NUNCIO_KNOWLEDGE_PROVIDER" in live_changed:
+            engine.knowledge_trusted = bool(
+                candidate.NUNCIO_KNOWLEDGE_PROVIDER
+                and candidate.provider_registry.get(
+                    candidate.NUNCIO_KNOWLEDGE_PROVIDER, {}).get("trusted", False)
+            )
+        if "NUNCIO_ASSIST_PROVIDER" in live_changed:
+            engine.assist_trusted = bool(
+                candidate.NUNCIO_ASSIST_PROVIDER
+                and candidate.provider_registry.get(
+                    candidate.NUNCIO_ASSIST_PROVIDER, {}).get("trusted", False)
+            )
         if any(k in live_changed for k in
                ("NUNCIO_LLM_CB_FAILS", "NUNCIO_LLM_CB_WINDOW_S", "NUNCIO_LLM_CB_COOLDOWN_S")):
-            engine.breaker.reconfigure(
-                candidate.NUNCIO_LLM_CB_FAILS,
-                candidate.NUNCIO_LLM_CB_WINDOW_S,
-                candidate.NUNCIO_LLM_CB_COOLDOWN_S,
-            )
+            # P2: knobs stay plane-global -- reconfigure every breaker
+            # object (default + per-provider map), deduplicated by identity
+            # since the active one may alias a map entry.
+            seen = set()
+            for br in [engine.breaker, *engine.provider_breakers.values()]:
+                if id(br) in seen:
+                    continue
+                seen.add(id(br))
+                br.reconfigure(
+                    candidate.NUNCIO_LLM_CB_FAILS,
+                    candidate.NUNCIO_LLM_CB_WINDOW_S,
+                    candidate.NUNCIO_LLM_CB_COOLDOWN_S,
+                )
         if "NUNCIO_MODE" in live_changed:
             engine.mode = candidate.NUNCIO_MODE
         if "NUNCIO_ENRICH_FORMAT" in live_changed:
@@ -1227,6 +1613,10 @@ def apply_changes(app, set_map, reset_list=None):
             app.token = candidate.NUNCIO_INGEST_TOKEN or None
         if "NUNCIO_DEFAULT_SOURCE" in live_changed:
             app.default_source = candidate.NUNCIO_DEFAULT_SOURCE
+        if "NUNCIO_DIGEST_WINDOW_S" in live_changed:
+            # Read per-ingest from the App attribute (no component rebuild:
+            # the window only gates the digest decision in App.ingest).
+            app.digest_window_s = float(candidate.NUNCIO_DIGEST_WINDOW_S)
         if "NUNCIO_LOG_LEVEL" in live_changed:
             logging.getLogger().setLevel(getattr(logging, candidate.NUNCIO_LOG_LEVEL.upper(), logging.INFO))
 
@@ -1270,6 +1660,13 @@ def masked_config_dict(settings):
     d = settings.as_dict()
     masked = {}
     for k, v in d.items():
+        if k == "NUNCIO_PROVIDERS_JSON":
+            # Structured masked view (ids, redacted URLs, ref names, key
+            # presence) -- never secret values; see _masked_providers_view.
+            # NOT in SECRET_KEYS: whole-blob «set»/«unset» would hide which
+            # providers exist from the operators reading /config.json.
+            masked[k] = _masked_providers_view(settings)
+            continue
         if k in SECRET_KEYS:
             default = _SCHEMA[k][0] if k in _SCHEMA else None
             masked[k] = "«set»" if (v and v != default) else "«unset»"
@@ -1443,9 +1840,41 @@ def build_gatherer(settings, store, health=None,
     # `_GATHERER_KEYS`, so `apply_changes` rebuilds this whole gatherer
     # (a fresh `build_gatherer` call with the new candidate Settings) rather
     # than mutating one in place -- see config.py's apply_changes.
+    # C3: learned-edge cache, per-gatherer lifetime (rebuilt with the
+    # gatherer on config change). Hourly recompute max; the store query is
+    # bounded (see nuncio.topology). Static `deps` keep sole gate authority
+    # -- learned edges are rank-only by construction. Defined before the
+    # closures that capture it (they resolve it at call time).
+    topo_state = {"at": 0.0, "edges": {}}
+    # C6: operator-feedback corrections (store.feedback_corrections), same
+    # hourly-TTL cache discipline as topology. Rank-only by construction
+    # (pre-clamped ±1.0 bumps on already-gated rows only -- see correlate's
+    # `corrections` param).
+    feedback_state = {"at": 0.0, "corrections": None}
+
+    def _feedback_corr(now):
+        try:
+            if now - float(feedback_state.get("at", 0.0)) >= 3600.0:
+                feedback_state["corrections"] = store.feedback_corrections(now=now)
+                feedback_state["at"] = now
+            return feedback_state.get("corrections") or {}
+        except Exception:
+            return {}
+
     history_fn = lambda a, k, now: collect_history(  # noqa: E731
         store, k, now, a, back_edge_s=settings.NUNCIO_CORRELATION_WINDOW_S,
         deps=deps, host_domains=settings.host_domains,
+        learned=topology.learn_edges(store, topo_state, now),
+        corrections=_feedback_corr(now),
+    )
+    # C2: store-only like recurrence/history (shared across profiles, no
+    # deep variant -- a 1h change window needs no widening at full depth).
+    changes_fn = lambda a, k, now: collect_changes(  # noqa: E731
+        store, a, k, now,
+    )
+    # C5: past-incident RAG source (store-only, redacted-first-lines only).
+    past_incidents_fn = lambda a, k, now: collect_past_incidents(  # noqa: E731
+        store, a, now,
     )
     collectors = {
         "recent_logs": lambda a, k, now: collect_recent_logs(logs_query, a),
@@ -1455,9 +1884,13 @@ def build_gatherer(settings, store, health=None,
         "correlated": lambda a, k, now: collect_correlated(
             store, k, now, window_s=settings.NUNCIO_CORRELATION_WINDOW_S, alert=a, deps=deps,
             host_domains=settings.host_domains,
+            learned=topology.learn_edges(store, topo_state, now),
+            corrections=_feedback_corr(now),
         ),
         "recurrence": recurrence_fn,
         "history": history_fn,
+        "changes": changes_fn,
+        "past_incidents": past_incidents_fn,
     }
     # Deep collector profile (Phase B, NUNCIO_ENRICH_DEPTH=full) -- constants,
     # not settings-screen knobs (see the Phase B spec's "constants, not
@@ -1474,9 +1907,13 @@ def build_gatherer(settings, store, health=None,
         "correlated": lambda a, k, now: collect_correlated(
             store, k, now, window_s=settings.NUNCIO_CORRELATION_WINDOW_S, alert=a, deps=deps,
             host_domains=settings.host_domains, limit=50, top_n=12,
+            learned=topology.learn_edges(store, topo_state, now),
+            corrections=_feedback_corr(now),
         ),
         "recurrence": recurrence_fn,
         "history": history_fn,
+        "changes": changes_fn,
+        "past_incidents": past_incidents_fn,
     }
     return Gatherer(collectors, timeout_s=settings.NUNCIO_GATHER_TIMEOUT_S,
                      max_bytes=settings.NUNCIO_BUNDLE_MAX_BYTES, full_collectors=full_collectors)
@@ -1519,9 +1956,9 @@ def _knowledge_redundant_with_private(settings):
     this is always True -- see Engine._garnish_with_knowledge's redundancy
     skip, which combines this static, settings-time fact with the per-alert
     depth."""
-    private_endpoint = _chat_completions_url((settings.NUNCIO_LLM_URL or "").rstrip("/"))
+    private_endpoint = _chat_completions_url((settings.private_url or "").rstrip("/"))
     knowledge_endpoint = _chat_completions_url((settings.knowledge_url or "").rstrip("/"))
-    return private_endpoint == knowledge_endpoint and settings.knowledge_model == settings.NUNCIO_LLM_MODEL
+    return private_endpoint == knowledge_endpoint and settings.knowledge_model == settings.private_model
 
 
 def build_router(settings):
@@ -1533,7 +1970,7 @@ def build_router(settings):
     # nothing (every route_knowledge() call misses).
     merged_table = {**DEFAULT_CLASSIFICATION_TABLE, **(operator_table or {})}
     return Router(
-        private_alias=settings.NUNCIO_LLM_MODEL,
+        private_alias=settings.private_model,
         knowledge_alias=settings.knowledge_model,
         classification_table=merged_table,
         knowledge_enabled=settings.NUNCIO_KNOWLEDGE_ENABLED,
@@ -1551,7 +1988,8 @@ def build_knowledge_llm(settings):
     if settings.NUNCIO_KNOWLEDGE_ENABLED:
         return LLMClient(
             settings.knowledge_url, settings.knowledge_key, settings.knowledge_model,
-            timeout=settings.NUNCIO_LLM_TIMEOUT_S,
+            timeout=settings.knowledge_timeout_s,
+            extra_headers=settings._knowledge_headers,
         )
     return None
 
@@ -1565,17 +2003,18 @@ def build_assist(settings, dispatch, store, metrics=None):
     the knowledge plane's ENABLED+URL pairing) -- `Engine.assist is None` is
     itself the "disabled" signal everywhere downstream, so a disabled assist
     plane behaves exactly like pre-Batch-C Nuncio."""
-    if not settings.NUNCIO_ASSIST_ENABLED or not settings.NUNCIO_ASSIST_URL:
+    if not settings.NUNCIO_ASSIST_ENABLED or not settings.assist_url:
         return None
     llm = LLMClient(
-        settings.NUNCIO_ASSIST_URL, settings.NUNCIO_ASSIST_KEY, settings.NUNCIO_ASSIST_MODEL,
-        timeout=settings.NUNCIO_ASSIST_TIMEOUT_S,
+        settings.assist_url, settings.assist_key, settings.assist_model,
+        timeout=settings.assist_timeout_s,
+        extra_headers=settings._assist_headers,
     )
     client = AssistClient(llm)
     table = settings.yaml.get("classification_table") if isinstance(settings.yaml, dict) else None
     return AssistTrack(
         client, dispatch, store, metrics=metrics,
-        timeout_s=settings.NUNCIO_ASSIST_TIMEOUT_S,
+        timeout_s=settings.assist_timeout_s,
         severities=settings.assist_severities,
         posture=settings.NUNCIO_ASSIST_DATA_POSTURE,
         classification_table=table or {},
@@ -1638,18 +2077,31 @@ def _knowledge_status(settings):
 
 
 def build_plane_info(settings):
+    def _plane_trusted(selector):
+        return bool(
+            selector and settings.provider_registry.get(selector, {}).get("trusted", False)
+        )
+
     return {
-        "private": {"model": settings.NUNCIO_LLM_MODEL},
+        "private": {
+            "model": settings.private_model,
+            "provider": settings.NUNCIO_LLM_PROVIDER or None,
+            "trusted": _plane_trusted(settings.NUNCIO_LLM_PROVIDER),
+        },
         "knowledge": {
             "enabled": settings.NUNCIO_KNOWLEDGE_ENABLED,
             "status": _knowledge_status(settings),
             "model": settings.knowledge_model if settings.NUNCIO_KNOWLEDGE_ENABLED else None,
+            "provider": settings.NUNCIO_KNOWLEDGE_PROVIDER or None,
+            "trusted": _plane_trusted(settings.NUNCIO_KNOWLEDGE_PROVIDER),
             "data": "anonymised problem-class only",
             "active_when": "low depth, or a distinct knowledge endpoint/model",
         },
         "assist": {
             "enabled": settings.NUNCIO_ASSIST_ENABLED,
-            "model": settings.NUNCIO_ASSIST_MODEL if settings.NUNCIO_ASSIST_ENABLED else None,
+            "model": settings.assist_model if settings.NUNCIO_ASSIST_ENABLED else None,
+            "provider": settings.NUNCIO_ASSIST_PROVIDER or None,
+            "trusted": _plane_trusted(settings.NUNCIO_ASSIST_PROVIDER),
             "posture": settings.NUNCIO_ASSIST_DATA_POSTURE,
         },
     }
@@ -1674,8 +2126,8 @@ def build_app(settings=None, clock=None):
     os.makedirs(settings.NUNCIO_DATA_DIR, exist_ok=True)
     store = Store(os.path.join(settings.NUNCIO_DATA_DIR, "alerts.db"))
     llm = LLMClient(
-        settings.NUNCIO_LLM_URL, settings.NUNCIO_LLM_KEY, settings.NUNCIO_LLM_MODEL,
-        timeout=settings.NUNCIO_LLM_TIMEOUT_S, extra_headers=settings.llm_headers,
+        settings.private_url, settings.private_key, settings.private_model,
+        timeout=settings.private_timeout_s, extra_headers=settings.private_headers,
     )
     delivery = build_delivery(settings)
     # Construct each collector client exactly once, wrap it for health
@@ -1695,14 +2147,40 @@ def build_app(settings=None, clock=None):
     knowledge_llm = build_knowledge_llm(settings)
     metrics = Metrics()
     assist = build_assist(settings, delivery, store, metrics=metrics)
+    # P1: plane-level trust flags. The PRIVATE flag is per-alert (captured
+    # at ingest into app.private_trusted); knowledge/assist flags gate
+    # whether a trusted alert may use those planes at all.
+    knowledge_trusted = bool(
+        settings.NUNCIO_KNOWLEDGE_PROVIDER
+        and settings.provider_registry.get(settings.NUNCIO_KNOWLEDGE_PROVIDER, {}).get("trusted", False)
+    )
+    assist_trusted = bool(
+        settings.NUNCIO_ASSIST_PROVIDER
+        and settings.provider_registry.get(settings.NUNCIO_ASSIST_PROVIDER, {}).get("trusted", False)
+    )
+    # P2: one breaker per registry provider (same cb_* knobs for all --
+    # knobs stay plane-global; isolation is per-endpoint). The engine's
+    # funnel always uses the ACTIVE provider's breaker (see
+    # Engine._active_breaker); trips/cooldowns therefore survive selector
+    # flips instead of resetting, and a flapping endpoint can't trip the
+    # breaker out from under a healthy one.
+    provider_breakers = {
+        pid: CircuitBreaker(settings.NUNCIO_LLM_CB_FAILS,
+                            settings.NUNCIO_LLM_CB_WINDOW_S,
+                            settings.NUNCIO_LLM_CB_COOLDOWN_S)
+        for pid in settings.provider_registry
+    }
     engine = Engine(
         store, llm, delivery, gatherer=gatherer,
-        budget_s=settings.NUNCIO_BUDGET_S, per_attempt_s=settings.NUNCIO_LLM_TIMEOUT_S,
+        budget_s=settings.NUNCIO_BUDGET_S, per_attempt_s=settings.private_timeout_s,
         cb_fails=settings.NUNCIO_LLM_CB_FAILS, cb_window_s=settings.NUNCIO_LLM_CB_WINDOW_S,
         cb_cooldown_s=settings.NUNCIO_LLM_CB_COOLDOWN_S,
         mode=settings.NUNCIO_MODE,
         clock=clock,
         router=router, knowledge_llm=knowledge_llm,
+        knowledge_trusted=knowledge_trusted, assist_trusted=assist_trusted,
+        provider_breakers=provider_breakers,
+        provider_id=settings.NUNCIO_LLM_PROVIDER or None,
         fingerprint_window_s=settings.NUNCIO_FINGERPRINT_WINDOW_S,
         evidence_max_bytes=settings.NUNCIO_EVIDENCE_MAX_BYTES,
         assist=assist,
@@ -1719,6 +2197,8 @@ def build_app(settings=None, clock=None):
         concurrency=settings.NUNCIO_CONCURRENCY, queue_max=settings.NUNCIO_QUEUE_MAX,
         clock=clock, retention_s=settings.NUNCIO_RETENTION_DAYS * 86400,
         full_budget_s=settings.effective_full_budget_s,
+        digest_window_s=float(settings.NUNCIO_DIGEST_WINDOW_S),
+        private_trusted=settings.private_trusted,
         token=settings.NUNCIO_INGEST_TOKEN or None,
         default_source=settings.NUNCIO_DEFAULT_SOURCE,
         config_json=json.dumps(masked_config_dict(settings), sort_keys=True).encode(),
@@ -1740,5 +2220,10 @@ def build_app(settings=None, clock=None):
         name: getattr(settings, name, spec.default)
         for name, spec in UI_EDITABLE.items() if spec.category == "restart"
     }
+    # P2: the legacy unlabelled breaker series tracks the ACTIVE breaker so
+    # pre-existing rules keep working after a provider is selected (the
+    # labelled per-provider series in Metrics.render cover the map).
+    if hasattr(app.metrics, "breaker"):
+        app.metrics.breaker = engine._active_breaker()
     log_startup_config(settings)
     return app, settings

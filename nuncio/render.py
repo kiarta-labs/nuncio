@@ -54,7 +54,7 @@ def _evidence_appendix(sections_red, evidence_max_bytes):
 
 def build_envelope(enrichment_text, red_raw, severity="unknown", host="", service="",
                     marker=False, detail_html=None, recurrence_count=0, window_label="",
-                    sections_red=None, evidence_max_bytes=32000) -> Envelope:
+                    sections_red=None, evidence_max_bytes=32000, entity=None, header=None) -> Envelope:
     """Build the one Envelope delivered for an alert.
 
     `enrichment_text` is the (already knowledge-garnished, if applicable)
@@ -66,15 +66,23 @@ def build_envelope(enrichment_text, red_raw, severity="unknown", host="", servic
     slack/stdout/webhook) -- brief renders never read `detail`/`detail_html`
     (already structural, see nuncio/delivery/__init__.py's Dispatch), so this
     never affects a brief channel.
+
+    S-track: `entity` (best_display_name) overrides the headline's identity
+    composition; `header` (pre-rendered "Severity:/Affected:" block) is
+    prepended to `detail` AFTER summary/headline are derived from the
+    enrichment text, so the terse legs keep reading the issue first line.
     """
     enrichment_text = enrichment_text or ""
     summary = _first_line(enrichment_text)
     prefix = (RAW_FALLBACK_MARKER + "\n") if marker else ""
     detail = f"{prefix}{enrichment_text.rstrip()}\n\n--- Raw alert:\n{red_raw}"
+    if header:
+        detail = f"{str(header).strip()}\n\n{detail}"
     detail += _evidence_appendix(sections_red, evidence_max_bytes)
     headline = build_headline(
         severity, host, service, summary,
         recurrence_count=recurrence_count, window_label=window_label,
+        entity=entity,
     )
     envelope = Envelope(
         severity=severity, host=host or "", service=service or "",

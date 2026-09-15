@@ -23,9 +23,10 @@ box (the original #2 production bug: an instance-less alert's `"-"`
 placeholder even matched hyphens inside unrelated names via a bare regex).
 A row sharing the alert's (canonicalized) host but failing the gate may
 still be surfaced, but only LABELED `also active on <host>` — context, never
-cause. Recency, error-token overlap, category, and shared path tokens are
-RANK-ONLY signals: they order rows that already passed the gate (or order
-grouping rows among themselves) — they never admit a row on their own.
+cause. Recency, error-token overlap, category, shared path tokens, and semantic
+wording overlap are RANK-ONLY signals: they order rows that already passed
+the gate (or order grouping rows among themselves) — they never admit a row
+on their own.
 
 Two-tier output:
   - Tier 0 (causal) = gated rows — reasons from whichever gate key(s) hit,
@@ -63,6 +64,8 @@ import re
 from nuncio.fingerprint import fingerprint as _compute_fingerprint
 from nuncio.model import canonical_host, real_host
 from nuncio.resolver import resolve_unit_strict
+from nuncio.semantic import bonus_for as _semantic_bonus
+from nuncio.semantic import similarity as _semantic_similarity
 
 _HOST_WEIGHT = 3.0  # rank-only now (grouping label weight), never a gate contributor
 _SERVICE_WEIGHT = 2.0
@@ -75,6 +78,7 @@ _CATEGORY_WEIGHT = 1.5
 _PATH_WEIGHT = 1.0
 _MAX_PATH_SCORE = 2.0
 _DEP_WEIGHT = 2.0
+_LEARNED_WEIGHT = 1.0  # C3: learned co-occurrence edges (rank-only, never a gate)
 _SUMMARY_LEN = 160
 _MAX_PATH_TOKENS = 4
 
@@ -122,15 +126,41 @@ def _age_suffix(created_at, now):
     return f"{minutes / 60.0:.1f}h ago"
 
 
-def rank_correlated(rows, alert, tokens=(), now=0.0, window_s=600, top_n=8, deps=None, host_domains=()):
+def _services_conflict(a_service, a_unit, r_service_norm, r_unit):
+    """Strong-label veto (C1): both sides carry a service/unit identity and
+    they disagree -- semantic wording overlap must not re-order such rows
+    (e.g. "host A triggers host B" vs "host B triggers host A" score
+    identically to Jaccard). Missing either side is NOT a conflict (nothing
+    to contradict). The veto covers the semantic BONUS only -- gate
+    authority is untouched (a fingerprint-hit with differing services still
+    groups as recurrence, just without the wording bonus). Comparisons use
+    the already-normalized (lowercased, placeholder-guarded) forms, so
+    CheckMK-style capitalization drift ("DB-Primary" vs "db-primary") never
+    vetoes."""
+    if a_service and r_service_norm and a_service != r_service_norm:
+        return True
+    if a_unit and r_unit and r_unit != a_unit:
+        return True
+    return False
+
+
+def rank_correlated(rows, alert, tokens=(), now=0.0, window_s=600, top_n=8, deps=None, host_domains=(),
+                    learned=None, corrections=None):
     """`rows`: store.recent() shape (3-/7-/9-tuple), oldest-first.
     Returns rendered `- summary [reasons]` lines, best-correlated first,
     capped to `top_n` across BOTH tiers (tier 0 causal rows always precede
     tier 1 grouping rows). `deps` is an optional {service: [upstream, ...]}
     map (see nuncio.config's `dependency_hints`). `host_domains` is the
     ordered tuple of DNS suffixes (NUNCIO_HOST_DOMAINS) stripped when
-    comparing hosts — see nuncio.model.canonical_host. See the module
-    docstring for the full causal-entity-gate model."""
+    comparing hosts — see nuncio.model.canonical_host. `learned` is an
+    optional {service: [co-firing services]} map from nuncio.topology --
+    RANK-ONLY (never admits): matching rows gain a small score bump with an
+    honest "often seen together" reason. `corrections` is an optional
+    {(service_a, service_b): signed_bump} map from operator feedback
+    (nuncio.store.feedback_corrections) -- the bump is pre-clamped to ±1.0
+    and likewise RANK-ONLY: it re-orders already-admitted rows, never admits
+    one, so a bogus operator click can mis-rank but never gate. See the
+    module docstring for the full causal-entity-gate model."""
     try:
         a_host = canonical_host(alert.get("host"), host_domains)
         # Legacy-row regex fallback needs the RAW (pre-canonicalization) real
@@ -152,6 +182,9 @@ def rank_correlated(rows, alert, tokens=(), now=0.0, window_s=600, top_n=8, deps
         a_unit = resolve_unit_strict(alert)
         unit_re = _word_re(a_unit) if a_unit else None
         alert_category = alert.get("category")
+        # C1: full-text side for the wording-overlap signal (service +
+        # output; tokenize() length-caps internally).
+        alert_text = f"{service or ''} {alert.get('output') or ''}"
         path_tokens = _PATH_TOKEN_RE.findall(str(alert.get("output") or ""))[:_MAX_PATH_TOKENS]
         upstreams = []
         if deps and service:
@@ -265,6 +298,31 @@ def rank_correlated(rows, alert, tokens=(), now=0.0, window_s=600, top_n=8, deps
                             if path_score >= _MAX_PATH_SCORE:
                                 break
                     score += min(path_score, _MAX_PATH_SCORE)
+                    # C1: wording overlap re-orders gated rows only, behind
+                    # the strong-label veto (see _services_conflict).
+                    if not _services_conflict(a_service, a_unit, r_service_norm, r_unit):
+                        sim = _semantic_similarity(alert_text, summary)
+                        gain = _semantic_bonus(sim)
+                        if gain > 0:
+                            score += gain
+                            reasons.append(f"similar wording ({sim:.0%})")
+                    # C6: operator-feedback pair correction -- RANK-ONLY with
+                    # a pre-clamped ±1.0 bump, applied to gated rows only.
+                    if corrections and r_service_norm and a_service:
+                        bump = corrections.get(tuple(sorted((a_service, r_service_norm))))
+                        if bump:
+                            score += float(bump)
+                            reasons.append("operator merge" if bump > 0 else "operator split")
+                    # C3: learned co-occurrence -- rank-only by construction
+                    # (this whole block runs only for gated rows). Direction
+                    # is unknown, so the reason claims none ("often seen
+                    # together", never upstream/downstream).
+                    if learned and r_service_norm and a_service:
+                        co = learned.get(a_service) or []
+                        back = learned.get(r_service_norm) or []
+                        if r_service_norm in co or a_service in back:
+                            score += _LEARNED_WEIGHT
+                            reasons.append(f"often seen together with {r_service}")
                     if host_grouped:
                         score += _HOST_WEIGHT
                         reasons.append(f"also active on {a_host}")

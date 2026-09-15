@@ -21,6 +21,39 @@ def _labels_hash(labels):
     return hashlib.sha256(canon.encode()).hexdigest()[:16]
 
 
+def _extract_value(entry):
+    """The value behind the alert: `annotations.value` (Prometheus-style
+    string), else `valueString`, else the compacted per-series values. Mirrors
+    Grafana's `_extract_value` shape without importing it (alertmanager must
+    stay a leaf module)."""
+    try:
+        annotations = entry.get("annotations") or {}
+        v = annotations.get("value") or annotations.get("valueString")
+        if v is not None:
+            return str(v)
+        values = entry.get("values")
+        if isinstance(values, dict):
+            return ",".join(f"{k}={val}" for k, val in sorted(values.items()))
+    except Exception:
+        return None
+    return None
+
+
+def _extract_links(annotations):
+    """Runbook link(s) from annotations (Alertmanager conventions:
+    `runbook_url` / `runbook` / `wiki`). Keep it to runbook-type links —
+    generator/silence URLs are operational plumbing, not enrichment."""
+    try:
+        parts = []
+        for key in ("runbook_url", "runbook", "wiki"):
+            v = (annotations.get(key) or "").strip()
+            if v:
+                parts.append(str(v))
+        return " · ".join(parts) or None
+    except Exception:
+        return None
+
+
 @register
 class Alertmanager(SourceAdapter):
     name = "alertmanager"
@@ -59,6 +92,16 @@ class Alertmanager(SourceAdapter):
                     "severity": severity,
                     "output": output, "timestamp": starts, "source": self.name,
                 }
+                # C6 source parity with Grafana: surface the triggering value
+                # (annotations value/valueString, else the summed values) and
+                # the runbook link, so Alertmanager alerts carry the same
+                # enrichment extras Grafana's already do.
+                value = _extract_value(a)
+                if value:
+                    alert["value"] = value
+                links = _extract_links(annotations)
+                if links:
+                    alert["links"] = links
                 # labels/annotations come straight from arbitrary JSON -- coerce
                 # defensively (see SourceAdapter._coerce_str_fields).
                 self._coerce_str_fields(alert)

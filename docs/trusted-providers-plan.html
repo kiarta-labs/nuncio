@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nuncio — Trusted / Untrusted LLM Providers + Correlation Plan</title>
+<style>
+:root { color-scheme: light dark; }
+body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; line-height: 1.5; max-width: 1020px; margin: 2rem auto; padding: 0 1.25rem; }
+h1, h2, h3, h4 { line-height: 1.25; }
+h2 { border-bottom: 1px solid #8885; padding-bottom: .3rem; margin-top: 2.2rem; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre { background: #8881; padding: .8rem 1rem; overflow-x: auto; border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { border: 1px solid #8885; padding: .45rem .6rem; text-align: left; vertical-align: top; }
+th { background: #8882; }
+.badge { display: inline-block; padding: .1rem .5rem; border-radius: 999px; background: #8882; font-size: .85em; }
+.locked { background: #1a7f3733; border: 1px solid #1a7f3766; padding: .8rem 1rem; border-radius: 8px; }
+.warn { background: #9a670033; border: 1px solid #9a670066; padding: .8rem 1rem; border-radius: 8px; }
+.small { font-size: .9em; color: #888; }
+.toc a { text-decoration: none; }
+.toc li { margin: .2rem 0; }
+</style>
+</head>
+<body>
+<h1>Nuncio — Trusted / Untrusted LLM Providers + Correlation Improvement Plan</h1>
+<p class="small">Status: <span class="badge">PLAN — do not implement until approved</span> &nbsp; Scope: provider registry + trust-aware data plane (P0–P2) + review-driven fixes (Q1–Q5) + structured output (S-track) + correlation/enrichment track (C1–C6). Public-repo safe: no deployment secrets, hostnames, or internal identifiers.</p>
+<p class="small">Evidence base: 10-day corpus review (226 alerts: 169 enriched / 57 raw — 47 queue-shed in two bursts; knowledge garnish on 170/170 enriched incl. 59/59 ok/info; avg 7,072 prompt tokens in → 144 out) plus render-path and redaction-path code verification. Corpus findings are folded in as Q-track (§5) and S-track (§6).</p>
+
+<div class="locked">
+<strong>Locked decisions (operator-confirmed):</strong>
+<ol>
+<li><strong>Trusted = skip ALL redaction</strong> (precise boundary in §0.4). A provider flagged trusted receives the full relevant alert + context with no secret-pattern, entropy-backstop, or scrub pass applied on the private-plane leg.</li>
+<li><strong>Keys env-only.</strong> Provider API keys are never stored in <code>settings-overrides.json</code>, never edited via the settings UI, never returned by any GET endpoint. Registry stores <code>api_key_ref</code> (an environment variable name); the process resolves the value from its own environment at boot.</li>
+<li><strong>FULL relevant data for trusted.</strong> Trusted private-plane calls receive the complete relevant surface (§2): all allowlisted alert extras at full caps, full gathered bundle sections at the active depth budget, triage notes (full depth), and correlated/history/recurrence lines — unredacted.</li>
+</ol>
+</div>
+
+<h2>Contents</h2>
+<ol class="toc">
+<li><a href="#s0">0. Current architecture (ground truth)</a></li>
+<li><a href="#s1">1. P0 — Provider registry + providers pane (no behavior change)</a></li>
+<li><a href="#s2">2. What “FULL relevant data” means (inventory)</a></li>
+<li><a href="#s3">3. P1 — Trust-aware data plane (skip-all-redaction for trusted)</a></li>
+<li><a href="#s4">4. P2 — Hardening, observability, rollout</a></li>
+<li><a href="#s5">5. Review-driven fixes Q1–Q5 (10-day evidence)</a></li>
+<li><a href="#s6">6. Structured output S-track (severity · affected · issue)</a></li>
+<li><a href="#s7">7. Correlation / enrichment track C1–C6</a></li>
+<li><a href="#s8">8. Adversarial review + risks</a></li>
+<li><a href="#s9">9. Test matrix</a></li>
+<li><a href="#s10">10. File-change index</a></li>
+<li><a href="#s11">11. Acceptance checklists</a></li>
+</ol>
+
+<h2 id="s0">0. Current architecture (ground truth)</h2>
+<h3>0.1 Provider model</h3>
+<p>There is no provider registry. <code>nuncio/llm.py</code> speaks to any OpenAI-compatible <code>POST {base}/chat/completions</code>; the model field is an opaque alias. Three hard-coded planes exist in <code>nuncio/config.py</code> <code>_SCHEMA</code>: private (<code>NUNCIO_LLM_URL/KEY/MODEL/…</code>), knowledge (<code>NUNCIO_KNOWLEDGE_*</code>, inherits private when empty), assist (<code>NUNCIO_ASSIST_*</code> with <code>DATA_POSTURE=generic|scrubbed-real</code> + <code>CONFIRM_EXTERNAL_OK</code> double-gate). Wire targets (URL/key/headers/posture/confirm) are <code>NEVER</code>-keys: env-only, read-only + lock icon in UI, <code>POST /settings</code> rejects them. Only the model alias and shaping knobs are <code>UI_EDITABLE</code>. <code>GET /settings.json</code> and <code>GET /config.json</code> are unauthenticated with secrets masked to <code>set/unset</code>.</p>
+<h3>0.2 LLM call layers</h3>
+<p>Single transport <code>LLMClient.enrich()</code> (<code>nuncio/llm.py:115</code>). All private calls funnel through <code>Engine._call_bounded</code> (<code>nuncio/engine.py:1149</code>: deadline-clamped socket timeout, circuit breaker on retryable 5xx/429/transport only, abandonment accounting). Layers:</p>
+<ul>
+<li><strong>Standard single call</strong> (<code>_enrich</code>): low depth + degraded-full. 30s budget, 10s per-attempt.</li>
+<li><strong>Full triage</strong> (call 1/2): 15s, log/metric-free, store-only correlated/history/recurrence, plain text, never fails the alert.</li>
+<li><strong>Deep RCA</strong> (call 2/2): 45s, full bundle + triage notes + up to 3 correlations, structured-JSON ladder with capability fallback + one retry.</li>
+<li><strong>Knowledge garnish</strong> (<code>_garnish_with_knowledge</code>): generic classification-table string only, never alert text; skipped as redundant at full depth on a shared endpoint/model; deliberately bypasses the breaker.</li>
+<li><strong>Assist</strong> (<code>nuncio/assist.py</code>): post-delivery worker, own 60s budget, <code>ScrubbedPayload</code>-gated (<code>isinstance</code> enforced), fail → deliver without insight.</li>
+</ul>
+<h3>0.3 Redaction + correlation baseline</h3>
+<p>Redaction is always-on and destructive: ingest redacts <code>raw_text</code> <em>before</em> persist/queue (<code>nuncio/server.py:253</code>), so the store, bundle audit, and dashboard only ever see redacted text. Pre-LLM per-field + per-section redact, post-LLM echo redact, knowledge double-scrub, assist 5-stage scrub. Correlation is deterministic: fingerprint (<code>sha1(source|host|signature)[:16]</code>) + causal gate (fingerprint | same service | same strict-unit | declared dependency), host grouping-only, 600s window, flap suppression available. Enrichment sections: recent logs, container state, metrics, kernel, correlated, history, recurrence — assembled by <code>nuncio/bundle.py</code> in fixed order with least-important-first truncation.</p>
+
+<h3>0.4 Threat model — trust ≠ injection safety (adversarial-review finding #1)</h3>
+<p>"Skip ALL redaction" means precisely: skip the secret-pattern catalog, the entropy backstop, and the plane-scrub passes on the private leg. It never means skipping anything in §3.3. Three risk classes, three separate mechanisms:</p>
+<ul>
+<li><strong>Secret/credential leakage</strong> (OWASP LLM02:2025 class) — handled by redaction + scrubs + NEVER-keys + masked GETs. The trusted tier narrows rather than removes this: raw stays inside an operator-designated boundary (local process → trusted endpoint → operator-owned delivery channel) and never at rest.</li>
+<li><strong>Analysis manipulation via crafted content</strong> (OWASP LLM01:2025) — <strong>trust level is irrelevant here.</strong> Alert text and log lines are attacker-influenceable on either tier. Defenses, all trust-independent: segregated + neutralized external content (BUNDLE sentinels, forged-sentinel stripping), a constrained output contract (JSON schema + deterministic validation and post-LLM gates), and least privilege in the strong sense — the model holds no tools, credentials, or actuators; its output is advisory text consumed by a human reader, and no auto-remediation path exists anywhere in the pipeline. OWASP notes no fool-proof injection prevention exists; the architecture answers with layering plus human-in-the-loop by construction. <strong>Accepted residual:</strong> a crafted line can nudge the wording of an advisory push message; it cannot trigger action, reconfigure anything, or reach another system. S-track shrinks even this (identity/severity composed in code, not prose).</li>
+<li><strong>Exfiltration to hosted endpoints</strong> — handled by the knowledge/assist skip-by-default for trusted alerts, explicit per-plane trust, and a startup warning when a trusted provider points at a non-private address (P1 §3.1).</li>
+</ul>
+
+<h2 id="s1">1. P0 — Provider registry + providers pane (no behavior change)</h2>
+<p><strong>Goal:</strong> introduce the provider concept, the configuration surface, the UI pane, and per-plane selectors — with zero change to what any LLM receives. All seeded providers behave exactly as today (fully redacted). P0 is the safe merge point.</p>
+<h3>1.1 Schema</h3>
+<pre>{
+  "&lt;id&gt;": {
+    "base_url": "http://your-llm-gateway:11434/v1",
+    "model": "your-model-alias",
+    "timeout_s": 10.0,
+    "headers": {},
+    "api_key_ref": "SOME_ENV_NAME"
+  }
+}</pre>
+<ul>
+<li>New <code>_SCHEMA</code> keys in <code>nuncio/config.py</code>: <code>NUNCIO_PROVIDERS_JSON</code> (<code>NEVER</code>, restart-by-env), <code>NUNCIO_LLM_PROVIDER</code> / <code>NUNCIO_KNOWLEDGE_PROVIDER</code> / <code>NUNCIO_ASSIST_PROVIDER</code> (live, <code>UI_EDITABLE</code>, plain strings, not secrets).</li>
+<li><code>api_key_ref</code> must match <code>[A-Z0-9_]+</code>. Resolution reads <code>os.environ[ref]</code> from the boot environment only — never from <code>settings-overrides.json</code>, never from a POST body. <strong>Fail-closed on typos</strong> (adversarial-review finding #2): a ref that is set but unresolvable is a <code>ConfigError</code> when the provider's <code>base_url</code> is non-local (anything outside <code>localhost</code>/<code>127.*</code>/<code>::1</code>/RFC1918, checked with stdlib <code>ipaddress</code>, no new dependency) — a silent downgrade to unauthenticated calls is unacceptable against a hosted endpoint; warn-only when the URL is local. An <em>absent</em> ref stays legal (unauthenticated local-model default, mirroring today's empty-key posture). Precedent for fail-fast wiring validation is the existing <code>ASSIST_ENABLED=true requires ASSIST_URL</code> error.</li>
+<li>Resolved secrets live in memory only (<code>settings.provider_secrets</code>), excluded from <code>as_dict</code>, <code>masked_config_dict</code>, overrides file, and audit logs (key names only).</li>
+<li>Validation (boot + <code>apply_changes</code> candidate path): JSON parses; registry holds at most 16 providers (<code>ConfigError</code> above that — metric-cardinality bound enforced at config time, not in UI); each entry has a valid <code>base_url</code>; selectors reference existing ids; empty knowledge selector = inherit private (preserves current inheritance + redundancy-skip); <code>ASSIST_ENABLED</code> still requires a resolved assist <code>base_url</code>.</li>
+</ul>
+<h3>1.2 Migration (back-compat, one release)</h3>
+<p>When <code>NUNCIO_PROVIDERS_JSON</code> is empty, seed at boot from legacy vars and log once:</p>
+<table>
+<tr><th>Legacy vars</th><th>Seeded provider</th><th>Selector default</th></tr>
+<tr><td><code>NUNCIO_LLM_URL/KEY/MODEL/TIMEOUT/HEADERS</code></td><td><code>private</code></td><td><code>NUNCIO_LLM_PROVIDER=private</code></td></tr>
+<tr><td><code>NUNCIO_KNOWLEDGE_URL/KEY/MODEL</code> (if distinct URL set)</td><td><code>knowledge</code></td><td><code>NUNCIO_KNOWLEDGE_PROVIDER=knowledge</code>, else empty = inherit</td></tr>
+<tr><td><code>NUNCIO_ASSIST_URL/KEY/MODEL/TIMEOUT</code></td><td><code>assist</code></td><td><code>NUNCIO_ASSIST_PROVIDER=assist</code></td></tr>
+</table>
+<p>Keep legacy vars for one release (registry wins on conflict + warns). <code>classification_table</code> / <code>dependency_hints</code> (<code>NUNCIO_CONFIG</code>) are unchanged.</p>
+<h3>1.3 Engine + client lifecycle</h3>
+<ul>
+<li><code>build_app</code> resolves per-plane triples (<code>private_*</code>/<code>knowledge_*</code>/<code>assist_*</code>) in <code>Settings</code>; builders consume them, so the engine holds the same single clients as today (as-built: no provider map yet — the client/breaker map arrives with per-provider breakers in P2, where it belongs). Capability cache stays per-<code>LLMClient</code> instance, and every selector flip rebuilds the client, so a stale <code>response_format</code> rejection can never leak across endpoints (existing <code>ENRICH_FORMAT</code> precedent).</li>
+<li>Extra headers deliberately do <strong>not</strong> fall back to the legacy value when a selector is set (as-built correction: headers can carry credentials — silently sending the legacy endpoint's headers to a different endpoint would leak and/or break; an entry states its headers explicitly). Model/timeout fall back safely.</li>
+<li>Extra headers deliberately do <strong>not</strong> fall back to the legacy value when a selector is set (they can carry credentials) — an entry states its headers explicitly. Model/timeout fall back safely.</li>
+<li><code>Engine.llm</code> / <code>knowledge_llm</code> / assist client become resolved pointers into that map. Add selector names to <code>_LLM_ROUTER_KEYS</code> / <code>_ASSIST_KEYS</code> so <code>apply_changes</code> rebuilds the right legs (existing <code>ENRICH_FORMAT</code> precedent).</li>
+<li>Selector swap is live (pointer swap, no thread restart); in-flight alerts are unaffected (mode/depth/deadline are per-alert). Registry JSON itself is env-only → process restart.</li>
+</ul>
+<h3>1.4 UI</h3>
+<ul>
+<li>New <code>providers</code> group under the <code>enrich</code> stage; selectors stay in their plane groups (<code>llm</code>/<code>knowledge</code>/<code>assist</code>) so existing layout is preserved.</li>
+<li>Registry row renders locked (lock icon + reason): id, <code>base_url</code> (redacted display), model, <code>api_key_ref</code> name + key-present <code>set/unset</code> — never the secret value. Selectors render as dropdowns populated from fetched provider ids (same upgrade pattern as the existing default-source select).</li>
+<li><strong>No trusted flag in P0.</strong> The registry parser accepts the field's shape but rejects a truthy value at boot ("arrives in P1") — P0 has no dual-track pipeline, so honoring trust is impossible and silently ignoring it would lie. Trust stays env-only in P1 too (no settings-screen toggle — see §3.1); the pane surfaces trust state read-only. This keeps P0 behavior-identical.</li>
+<li>Add <code>GET /providers/{id}/test</code> (admin-token gated): performs a 1-token <code>chat/completions</code> call against that provider with a static <code>ping</code> payload (no alert data) and returns latency + model echo. Used by the pane’s Test button.</li>
+</ul>
+<h3>1.5 P0 acceptance</h3>
+<ul>
+<li>Fresh boot with legacy env only → identical prompts, identical deliveries, all existing tests pass unmodified.</li>
+<li>Registry-configured boot → same outputs; selectors switch endpoints live; masked endpoints never expose keys; overrides file contains no secret material.</li>
+</ul>
+
+<h2 id="s2">2. What “FULL relevant data” means (inventory)</h2>
+<p>With redaction as identity, the private-plane LLM input is exactly the output of the prompt builders over <em>unredacted</em> alert + sections. Concretely:</p>
+<h3>2.1 Alert block</h3>
+<p>Base fields (<code>host ≤256, service ≤256, state ≤64, output ≤3072, timestamp ≤256</code> chars) plus the fixed allowlist extras (caps are truncation, not redaction — they stay): <code>details 6144, perfdata 2048, check_command 256 (head), event 64, ack 512, downtime 64, groups 256, address 128, recurrence 64, value 768, links 512</code> — tail-kept except <code>check_command</code>. Per source:</p>
+<ul>
+<li><strong>CheckMK:</strong> long output, perfdata, check command, notification type, ack author/comment, downtime flag, group names/tags, host address/alias, recurrence count.</li>
+<li><strong>Grafana:</strong> value string/values, runbook/panel/dashboard links (generator/silence URLs stay excluded).</li>
+<li><strong>Alertmanager:</strong> labels-derived host/service/output only (no value/links extras — see C-track note on parity).</li>
+<li><strong>OpenObserve:</strong> rendered match rows, condition/threshold string, firing query, unit/container hint.</li>
+<li><strong>Generic:</strong> host/service/message/severity key aliases, else pretty-printed JSON body.</li>
+</ul>
+<p>Still excluded even for trusted (structural, not redaction): non-allowlisted keys (<code>unit</code>, <code>source</code>, <code>category</code>, unmapped native macros, arbitrary ingest keys), over-cap overflow (with <code>[truncated, N chars]</code> markers), and triage-call exclusion of <code>details/perfdata</code>.</p>
+<h3>2.2 Context bundle (depth-dependent)</h3>
+<ul>
+<li>Standard: category-selected sections, 16&nbsp;KB cap. Deep: union of full-profile sections, up to 64&nbsp;KB.</li>
+<li>Sections: ranked log lines (100/300 lines, 8/24&nbsp;KB), container inspect (status/restarts/exit/started + 50/150 tail lines), metrics lines (40/80), kernel head+tail sample (50/150), correlated top 8/12 annotated lines, 24h history top 15, one-line recurrence.</li>
+<li>Order <code>container_state, recent_logs, metrics, kernel, correlated, history, recurrence</code>; truncation drops least-important first (recurrence survives); log-shaped sections cut old head, keep tail.</li>
+<li>Triage call (full depth): alert minus <code>details/perfdata</code> + store-only history/correlated/recurrence. RCA call: full bundle + plaintext analyst-notes block.</li>
+</ul>
+<p>Selection/ranking signals (error tokens, unit normalization, fingerprint basis, dependency edges, domain-suffix canonicalization) influence <em>which</em> rows survive but are not separately transmitted.</p>
+
+<h2 id="s3">3. P1 — Trust-aware data plane (skip-all-redaction for trusted)</h2>
+<div class="warn"><strong>Safety invariant:</strong> privacy-stripping is bypassed for trusted private-plane legs only. Injection defenses (sentinel neutralization), framing gates (disposition), structural type gates (<code>ScrubbedPayload</code>), evidence caps/escaping, and config masking all stay on in both tiers.</div>
+<h3>3.1 Trust flag + resolution</h3>
+<ul>
+<li>Registry entry gains <code>"trusted": false</code> (default). <strong>Trust is env-only, restart to change</strong> (correction folded from review implementation: the registry is a NEVER structure, and trust redefines the data boundary — a settings-screen toggle would put raw-exfiltration one admin-token POST away; the pane shows trust state read-only via <code>/providers.json</code>, changes are env edits with the startup warning below as witness). Metrics label trust state for greppability.</li>
+<li>Per-alert classification is captured <strong>at ingest only</strong> and rides the queue tuple as its final elements <code>(…, raw_full, …, trusted)</code> beside <code>mode</code>/<code>depth</code> (adversarial-review finding #3 — verified: <code>server.py</code> enqueues with the same capture-at-ingest discipline documented for mode/depth). The worker threads them into <code>Engine.process()</code>; the engine <strong>never re-resolves</strong> trust mid-pipeline, so a live toggle flip cannot re-route an in-flight alert (no TOCTOU). In-flight alerts keep the classification they started with. As-built, <code>process()</code> additionally fails closed at its choke point: <code>trusted</code> without a string <code>raw_full</code> degrades to the fully-untrusted path.</li>
+<li>Knowledge and assist planes keep their current scrubbed-only contract. A trusted alert <strong>skips</strong> the knowledge garnish and <strong>skips</strong> assist deferral (delivers the rich leg immediately) unless that plane's own provider entry is also flagged trusted. <strong>Startup warning</strong> (adversarial-review finding #4): any provider flagged trusted whose <code>base_url</code> is non-private logs an explicit WARNING naming the provider and stating that raw alert text will leave the network — sending raw to a hosted endpoint is then an acknowledged operator choice, never an accident. Egress-assertion tests stay as the second layer.</li>
+</ul>
+<h3>3.2 Dual-track pipeline (in-memory unredacted, redacted at rest)</h3>
+<ul>
+<li><strong>Ingest</strong> (<code>nuncio/server.py</code>): fork <code>raw_red = redact(raw_text)</code> (persist + queue-compat + all store writes + dashboard reads) and <code>raw_raw</code> (queue tuple extra field + worker stack only). Same split for the alert dict (<code>alert</code> as-ingested vs <code>red_alert</code>) and gather output (<code>sections_raw/bundle_raw</code> vs <code>sections_red/bundle_red</code>).</li>
+<li><strong>Never persist unredacted:</strong> <code>store.persist</code> and <code>set_bundle</code> always receive the redacted variant; stats columns (<code>enrichment</code>, <code>assist_insight</code>) store the re-redacted text even when the delivered copy was raw. Dashboard/store readers therefore cannot leak.</li>
+<li><strong>Fail closed:</strong> load-shed, expiry, restart/orphan sweep, and <code>_deliver_raw</code> all use the stored redacted copy. There is no reconstruction of the raw track. <strong>Accepted point of no return</strong> (adversarial-review finding #10.1): once an alert is <em>delivered</em> with raw content it lives in the notification channel — there is no clawback. Flipping trust off only affects subsequently ingested alerts. Start with a single trusted provider and soak before widening.</li>
+<li><strong>Never log unredacted:</strong> only <code>{type, count}</code> findings and <code>redaction_count</code> (0 for trusted) reach logs/metrics. No <code>repr</code> of raw structures in exceptions. Input-size truncation direction (truncate-and-drop) is preserved pre-LLM in both tiers.</li>
+<li><strong>Prompt construction:</strong> builders take <code>alert_raw/bundle_raw</code> when trusted, <code>alert_red/bundle_red</code> otherwise. Output echo-redact is bypassed only for the trusted private leg; the delivered <code>detail</code> then intentionally carries secrets over the operator-owned delivery channel (document this).</li>
+<li><strong>Envelope/evidence:</strong> caps, <code>_TRUNCATE_ORDER</code>, <code>html.escape</code>, and <code>--- Raw alert: / --- Evidence:</code> markers are unchanged; only the input variant switches. The evidence appendix for trusted uses raw sections.</li>
+</ul>
+<h3>3.3 What stays on (explicit non-goals for the bypass)</h3>
+<ul>
+<li>Sentinel neutralization (<code>prompt.py</code> bundle/triage neutralizers), disposition hard gate (<code>ok/info</code> strips cause/checks post-LLM), <code>_EXTRA_FIELD_SPECS</code> allowlist + caps, correlation gating, JSON validation/rendering, <code>ScrubbedPayload</code> type gate (trusted needs a <em>separate</em> method/type, e.g. <code>insight_trusted(raw: str)</code>, so the untrusted path cannot hand-roll a bypass — update the assist-gate grep test accordingly), config masking, bypass-mode exclusion from assist.</li>
+</ul>
+<h3>3.4 P1 acceptance</h3>
+<ul>
+<li>Untrusted alert → byte-identical prompts/deliveries to pre-P1 (golden-prompt diff clean).</li>
+<li>Trusted alert → prompts contain zero <code>«REDACTED:…»</code> placeholders from the secret catalog/entropy pass; store rows, bundles, dashboard reads, and stats columns remain fully redacted; logs contain no raw identifiers.</li>
+<li>Trusted alert with a hosted knowledge/assist endpoint configured → garnish skipped, rich leg delivered immediately, no hosted egress of raw text (assert via egress test double).</li>
+</ul>
+
+<h2 id="s4">4. P2 — Hardening, observability, rollout</h2>
+<ul>
+<li><strong>Per-provider breakers + metrics (as-built):</strong> <code>Engine.provider_breakers: dict[id, CircuitBreaker]</code> (same <code>cb_*</code> knobs for all — knobs stay plane-global) + <code>provider_id</code>; the funnel resolves the active breaker per call via <code>_active_breaker()</code>, so trips/cooldowns are isolated per endpoint and survive selector flips with no funnel-code duplication. Legacy installs (empty map) behave byte-identically. Render <code>nuncio_llm_breaker_trips_total{provider}</code> / <code>nuncio_llm_breaker_state{provider,state}</code> alongside the legacy unlabelled series, which follows the active breaker so pre-existing rules keep working. The per-call <code>llm_calls_total{provider,plane,outcome}</code> counter was deliberately skipped (breaker + abandoned + failures series already attribute load; dashboard <code>planes.private.calls_24h</code> covers volume).</li>
+<li><strong>Plane info + dashboard:</strong> <code>plane_info</code> gains <code>provider</code> (+ <code>trusted</code> boolean) per plane; dashboard pills render <code>model@provider</code> (+ trust marker) with no URL/key exposure.</li>
+<li><strong>Audit + confirm:</strong> trust toggle requires confirm modal; audit log records who/when/old→new; <code>redaction_count==0</code> + <code>provider/trusted</code> labels on the alert row make trusted deliveries greppable.</li>
+<li><strong>Docs:</strong> <code>docs/CONFIGURATION.md</code> (registry reference, trust contract, env-only rule, hosted-leg skip policy), <code>.env.example</code> (<code>NUNCIO_PROVIDERS_JSON</code> template), <code>config.example.json</code> untouched (classification/dependencies out of scope).</li>
+<li><strong>Rollout:</strong> deploy P0 → soak (selectors exercised, outputs diffed) → enable P1 with a single trusted local provider → verify store-redacted + prompt-raw split via audit queries → cut planes over one at a time. Rollback is selector flip + (if needed) trust-off; no data migration to undo because raw was never persisted.</li>
+</ul>
+
+<h2 id="s5">5. Review-driven fixes Q1–Q5 (10-day evidence)</h2>
+<p>Small, independently shippable fixes from the 10-day corpus review. Q1 and Q3 are one-condition changes — ship first. Item 6 from the review (category-aware routing, container resource context, recurrence throttling) maps onto S-track §6.5 and C-track extensions noted in C2/C4, not here.</p>
+<h3>Q1 — Skip knowledge garnish on ok/info (review item 1)</h3>
+<p><strong>Evidence:</strong> garnish fired on 170/170 enriched alerts, including 59/59 ok/info — every resolution notice ships a problem-framed generic essay. <strong>Change:</strong> hard gate in <code>_garnish_with_knowledge</code> (<code>nuncio/engine.py:1213</code>): return the enrichment unchanged when <code>disposition(severity) != "problem"</code> — same authority as the existing cause/checks gate (<code>engine.py:1035-1043</code>). No new config key (matches the disposition-gate precedent, not a knob). <strong>Tests:</strong> ok/info replay → zero <code>General guidance</code> blocks; token-delta accounting on the corpus. <strong>Accept:</strong> 0 garnished ok/info; problem-leg output byte-identical.</p>
+<h3>Q2 — Burst resilience for monitor sweeps (review item 2, REDESIGNED after evidence)</h3>
+<p><strong>Evidence (corrected — the first analysis misread the burst class):</strong> the 47 queue-sheds are <strong>26 critical TRIGGERED + 21 ok</strong> across ~25 distinct services in two one-minute bursts — a monitor sweep with every service flapping at once, <em>not</em> same-fingerprint info repeats. Same-fingerprint coalescing would have caught ~none of them. Three sub-fixes:</p>
+<ul>
+<li><strong>Q2a — severity-priority queue.</strong> FIFO sheds in arrival order, so criticals drown behind recoveries. The work queue becomes a priority queue (critical 0, warning/unknown 1, info 2, ok 3; FIFO sequence counter within a tier). Criticals always enrich first during bursts; overload still degrades to the existing raw fallback, just in the right order. Queue-full/load-shed semantics unchanged.</li>
+<li><strong>Q2b — ok-severity cheap path.</strong> Recovery notices run full-depth 2-call RCA today whose cause/checks output the disposition gate then <em>discards</em> — pure waste. At ingest, <code>severity == "ok"</code> forces <code>depth = "low"</code> (single call; summary kept). Info keeps global depth.</li>
+<li><strong>Q2c — cross-service digest for generic info/ok.</strong> Grouping key <code>(source, severity)</code> (the burst class is heterogeneous services, not repeats): first notice of a window goes immediately; subsequent arrivals within <code>NUNCIO_DIGEST_WINDOW_S</code> (<strong>default 0 = disabled, opt-in</strong> — review closure: defaulting ON would silently change delivery semantics for existing untrusted installs), are terminally recorded (<code>delivered_digested</code>) and folded into one enriched digest ("N services recovered" / "N update notices"). Criticals/warnings are never held; failure-marked items bypass. Digest state in-memory only; restart fails open with the first notice immediate (post-restart arrivals start a fresh window — adversarial-review finding #5). The digest's summary now counts and remembers the opening notice too (review closure #11), with bounded key/line caps.</li>
+</ul>
+<p><strong>Files:</strong> <code>server.py</code> (queue type, put/unpack sites, depth override, digest buffer/sweep/emit, maintenance duty, <code>nuncio_digested_total</code>), <code>store.py</code> (<code>mark_digested</code> CAS → <code>delivered_digested</code>, already covered by <code>purge_delivered</code>'s <code>LIKE 'delivered_%'</code>), <code>config.py</code> (<code>NUNCIO_DIGEST_WINDOW_S</code> schema + live key + <code>App</code> plumbing). <strong>Tests:</strong> priority order under burst; ok→low override; digest burst → 1 immediate + held + 1 digest; critical/warning bypass; restart fail-open; disabled window passthrough. <strong>Accept:</strong> burst replay enriches criticals first with zero update-attributable sheds; recovery legs cost one call. Ops note: raise <code>NUNCIO_CONCURRENCY</code> above 1 alongside (restart-required, endpoint-load dependent).</p>
+<h3>Q3 — Treat <code>"-"</code> host as missing in log queries (review item 3)</h3>
+<p><strong>Evidence:</strong> all OpenObserve alerts carry host <code>-</code>/None (template has no host field); one enrichment openly reports insufficient context from unrelated log lines. <strong>Verified mechanics:</strong> the codebase already treats <code>-</code> as missing everywhere via <code>real_host()</code> (<code>nuncio/model.py:126-133</code>; persist <code>server.py:276</code>, correlation <code>correlate.py:139</code>) — except the O2/Loki query builders, which test truthiness (<code>nuncio/clients/logs.py:153-156</code>), so <code>"-"</code> adds a <code>str_match(field,'-')</code> clause matching nearly every line. <strong>Change:</strong> guard both builders with <code>real_host(host)</code>; unit-only queries then run on the unit clause alone (the structured unit-field clause already exists as recall backup). Keep the adapter emitting <code>-</code> (fingerprint stability) — fix at the query site only. <strong>Tests:</strong> host <code>-</code> → no host clause in emitted SQL; unit-only recall parity on the corpus; the unrelated-lines case replays clean. <strong>Accept:</strong> no query ever contains a placeholder literal; ranked-log precision on unit-only alerts improves or holds.</p>
+<h3>Q4 — Read-only container visibility (review item 4)</h3>
+<p><strong>Evidence:</strong> <code>NUNCIO_CONTAINERS=null</code>, so 122/169 bundles carry an empty <code>Container state (container not found)</code> section and the thinnest alert class (vanished containers, 300–700 byte bundles) bottoms out at generic advice — no exit codes, no tails. <strong>Change:</strong> deployment-side: front the socket with a filtering proxy (candidate: <code>tecnativa/docker-socket-proxy</code>) and point the containers backend at it. <strong>Hard requirement from verification</strong> (adversarial-review finding #9): stock <code>CONTAINERS=1</code> also exposes GET-only filesystem reads (<code>/containers/{id}/archive</code>, <code>/export</code>) and process listings (<code>/top</code>) — a "read-only" proxy without sub-path denies is insufficient. The deployment must add explicit deny rules for <code>archive</code>/<code>export</code> (and <code>top</code> unless needed) ahead of the containers allow, keep <code>POST</code> disabled, and prove <code>POST /containers/create</code> and <code>GET …/archive</code> both 403 in acceptance testing against the pinned proxy version. Nuncio itself only ever calls <code>GET /containers/{name}/json</code> and <code>GET …/logs</code>. No prompt/bundle code changes; the existing <code>(container not found)</code> path is the automatic fallback if the proxy is unreachable. <strong>Tests:</strong> proxy-down replay → byte-identical output to today; proxy-up replay → populated state sections on the vanished-container class; deny-rule probe suite green. <strong>Accept:</strong> operator decision recorded (hardened proxy deployed, or explicitly deferred with the thin-context stub from S-track as the honest fallback).</p>
+<h3>Q5 — Device-name allowlist segments (review item 5)</h3>
+<p><strong>Evidence:</strong> CheckMK device names hit the entropy backstop inside the delivered raw line itself, so push headlines arrive anonymized from the operator too. <strong>Change:</strong> ops-side, no code: append the actual device-name segments to the settings-only <code>NUNCIO_REDACT_ALLOW_KEYWORDS</code> via <code>POST /settings</code> (segment-anchored, case-sensitive — add exact <code>-</code>/<code>.</code>/<code>_</code>-delimited segments, never whole hostnames). Verify by <code>redaction_count</code> delta and raw-headline spot check on the next firing of each affected check. <strong>Accept:</strong> raw lines name the device; unrelated-secret redaction counts unchanged.</p>
+
+<h2 id="s6">6. Structured output S-track (severity · affected · issue)</h2>
+<p><strong>Diagnosis (verified in code):</strong> the LLM writes the identity today — summary prose feeds the headline crux (<code>envelope.py:99-141</code>), so the "who" is a docker ID, <code>None</code>, a bare IP, or a redacted placeholder, while the deterministic facts sit behind the prose. Cause and checks share one paragraph with the issue, so thin-context alerts read as confident filler, and the 120-char brief-leg cut (<code>delivery/__init__.py:173</code>) can land mid-sentence. Best practice (PD-CEF shape: severity/source/component/class + summary; PagerDuty title/body/runbook guidance) is fields first, prose second — the layout below.</p>
+<h3>6.1 Format</h3>
+<p><strong>Push (brief) leg</strong> — title keeps <code>&lt;emoji&gt; &lt;entity&gt; — &lt;crux&gt;</code> but entity is engine-composed; body line 1 (inside the 120-char budget) is <code>WARNING · web-app on dock-01 · 13 restarts since 11:54</code>: severity as a word, never emoji-only.</p>
+<pre>Severity: Warning (firing since 11:54)
+Affected: web-app on dock-01 · container
+Issue: restarting frequently — 13 restarts vs threshold 1
+Likely cause: application crash or config error (exit evidence…)
+Next: 1) container logs  2) recent config change  3) host memory pressure
+Also: helper-queue crashed concurrently (possible shared cause)
+History: 3rd in 48h · Links: runbook · dashboard
+
+--- Raw alert / --- Evidence (unchanged)</pre>
+<p><code>ok</code>/<code>info</code> legs render Severity/Affected/Issue + resolution line only — no cause, no checks, no garnish (companion to Q1). A thin-context alert renders an honest stub (<code>Issue … on … — context unavailable</code>) instead of filler.</p>
+<h3>6.2 Contract + rendering</h3>
+<ul>
+<li><strong>LLM returns <code>{issue, likely_cause, checks[]}</code></strong> — no summary prose, no hostnames. <code>issue</code> required, ≤140 chars; <code>validate_structured</code> (<code>prompt.py:496-551</code>) swaps the <code>summary 10–250ch</code> rule for it. Engine composes Severity/Affected/History/Links deterministically from the alert dict + store, so invented hosts/ports (observed class) cannot reach the identity slots; checks stay advisory.</li>
+<li><strong><code>best_display_name()</code></strong> (new, <code>envelope.py</code>): <code>service on host</code> with canonical collapse, skipping <code>-</code>/None/redacted parts via the existing <code>real_host</code> guard; <strong>fallback chain</strong> (adversarial-review finding #8) when both are absent: <code>source</code>, then <code>source + category</code>, then the literal <code>alert</code> — never an empty string. Composed from the in-memory original; the normal untrusted output-redact pass still applies afterward (an untrusted entity may honestly render as a placeholder, matching today's raw line). Feeds headline, brief line 1, and the Affected row from one place.</li>
+<li><strong>Garnish repositioned</strong> below evidence under its own heading when kept (Q1 already removes it from ok/info) — it stops masquerading as analysis.</li>
+<li><strong>Migration:</strong> dual-contract release behind the existing format switch (legacy default for one release): legacy goldens byte-identical; new contract validated against the stored 10-day corpus (entity == alert dict on every row; brief ≤120 with severity+entity intact; stub shape on thin rows); then flip the default. Email HTML renders the header rows as a table.</li>
+</ul>
+<h3>6.3 Relation to other tracks</h3>
+<p>S-track needs P1's input-variant plumbing (raw-variant sections flow into the new renderer) — schedule it after P1 sign-off to avoid contract churn. Review item 6a (intent-aware knowledge routing) is substantially addressed by Q1 instead: update/info classes no longer receive crash guidance at all (garnish skipped off-problem); full intent-keyed routing remains future work. Items 6b/6c extend C2/C4 as noted there.</p>
+<h3>6.4 As-built deviations (verified green)</h3>
+<ul>
+<li><strong>Brief severity prefix dropped:</strong> the title already carries emoji + entity + crux; duplicating a severity word into the 120-char body costs crux budget for no new information. Brief stays title + issue-first-line.</li>
+<li><strong>Knowledge-garnish repositioning deferred:</strong> moving the garnish below evidence would restructure detail assembly for cosmetic ordering; Q1 already removed the harmful cases. Revisit only with evidence of confusion.</li>
+<li><strong>Entity separator stays <code>/</code>:</strong> <code>best_display_name</code> fixes <em>selection</em> (skips <code>-</code>/None/redacted, falls back source → source+category → literal) without churning the established <code>host/service</code> headline shape or downstream parsers.</li>
+<li><strong>Contract rename is dual, not cutover:</strong> <code>issue</code> (10–140ch) preferred, legacy <code>summary</code> (10–250ch) accepted only when <code>issue</code> is absent; the normalized result keeps the <code>summary</code> key so renderers are untouched.</li>
+</ul>
+
+<h2 id="s7">7. Correlation / enrichment track C1–C6</h2>
+<p>Baseline is deterministic Level-2 (dedup → temporal window → causal gate). Each phase below is independently shippable, keeps the existing gate as the admission authority, and adds rank-only or additive signals first.</p>
+<h3>C1 — Semantic near-dup (rank-only inside the gate)</h3>
+<p><strong>Problem:</strong> same meaning, different wording (e.g. Grafana vs CheckMK texts) never fingerprints together. <strong>Change (as-built):</strong> new <code>nuncio/semantic.py</code> (stdlib-only token-Jaccard + bounded operational window + <code>distribution()</code>); hook in <code>correlate.py</code> contributes up to +1.5 inside already-gated rows with a <code>similar wording (NN%)</code> reason. The veto is deliberately narrower than "vetoes grouping": it withholds the <em>bonus only</em> — gate authority is untouched, so a fingerprint-hit with differing services still groups as recurrence; comparisons run normalized-case so capitalization drift never vetoes. <strong>Visibility first</strong> (adversarial-review finding #6): Jaccard is synonym-blind and order-insensitive, so ship it with <code>nuncio_semantic_pairs_observed_total / _p50 / _p90 / _max</code> on <code>/metrics</code> — the operator watches the distribution to decide whether the embedding upgrade is worth it, and flat recall reads as a metric, not as silent correctness. <strong>Files:</strong> new <code>nuncio/semantic.py</code>, hook in <code>correlate.py</code> rank path, surfaced as a reason string. <strong>Accept:</strong> false-grouping rate measured on replay harness stays flat while near-dup recall rises; veto path covered incl. mixed-case service names.</p>
+<h3>C2 — Change-aware context (highest-yield RCA signal)</h3>
+<p><strong>Problem:</strong> “what changed in the last 15m” is absent from the bundle. <strong>Change:</strong> new optional <code>changes</code> collector section (recent image updates, config applies, restart bursts from already-available signals) appended to the bundle + a one-line <code>## Recent changes</code> header; capped like other sections. <strong>Files:</strong> <code>collectors.py</code>, <code>gatherer.py</code> category wiring, <code>bundle.py</code> order (near correlated, truncates early). <strong>Accept:</strong> degrades to <code>UNAVAIL</code> with no pipeline impact when no change feed is configured. Extension (review item 6b) redirected on evidence: neither backend exposes container CPU/mem (Prometheus emits host <code>up{}</code> lines, CheckMK host/service state), so bolting the existing metrics section onto container profiles would burn bundle bytes on almost-signal while breaking the single-signal narrowness discipline the test suite pins. Container resource visibility needs backend-aware queries (cAdvisor-style selectors) or the Q4 socket proxy — tracked as a follow-up, not smuggled into C2.</p>
+<h3>C3 — Learned co-occurrence edges, rank-only (as-built deviation)</h3>
+<p><strong>Problem:</strong> <code>dependency_hints</code> is hand-maintained and rots. <strong>Change (as-built):</strong> the live-manifest providers from the original plan (compose <code>depends_on</code>, CheckMK parents, network aliases) are all unavailable to a read-only Nuncio (no socket/config tree, CheckMK exposes no parents via the machine-visible API) — so C3 ships a <em>learned</em> edge set instead: new <code>nuncio/topology.py</code> mines near-repeat co-fire from the alert store (warning/critical only, once-per-service-per-day, ≥3 distinct shared days, 30d window + hourly TTL, ≤5 partners/service) into the same <code>{service: [partners]}</code> shape, merged <strong>rank-only</strong>: the boost (+1.0, "often seen together") applies to already-gated rows only, explicitly directionless (co-occurrence can't say who is upstream), and can never admit, suppress, or fabricate a chain. Static <code>dependency_hints</code> keep sole gate authority. <strong>Files:</strong> new <code>nuncio/topology.py</code> + <code>store.service_day_rows</code> (bounded), <code>correlate.py</code> (learned param), <code>collectors.py</code>/<code>config.py</code> threading. <strong>Accept:</strong> canary test proves a bogus learned edge re-ranks but never suppresses the true root (gate untouched).</p>
+<h3>C4 — Storm mode (rate-derivative response)</h3>
+<p><strong>Problem:</strong> cascades produce hundreds of alerts in seconds; per-alert enrichment wastes budget on symptoms. <strong>Change (as-built):</strong> an ingest-rate tracker (<code>App</code>, rolling 60s window; tripped at 20+ alerts/min, active for 300s, exposed as <code>nuncio_storm_entered_total</code> / <code>nuncio_storm_active</code>) downgrades non-critical alerts to the cheap single-call path while active — criticals never downgrade and already queue first under Q2a. The adaptive <em>correlation</em> window was dropped as structural over-reach (threading a per-alert window through every collector would blur the gate's determinism for marginal recall); the simplex is the depth lever. Extension (review item 6c) — recurrence-based throttling of non-alternating repeats (the observed 38× class) as periodic digests instead of every repeat — remains future work (flap suppression only triggers on alternating runs; a same-severity repeater is a distinct, delivery-policy change). <strong>Accept:</strong> burst replay downgrades symptoms to low depth with criticals full; storm metrics ride /metrics; storm clears after its window with behaviour byte-identical to before.</p>
+<h3>C5 — Past-incident RAG + calibrated confidence</h3>
+<p><strong>Problem:</strong> the model re-derives known fixes from scratch and overstates certainty. <strong>Change (as-built):</strong> <code>store.past_incidents(fp, limit)</code> (terminal delivered rows only; reads already-redacted enrichment/payload first lines — safe on both trust tiers), rendered as a capped <code>## Similar past incidents</code> store-only section; the structured contract gains an optional <code>confidence</code> (0–1) key, validated to [0,1] and rendered as <code>Confidence: NN%.</code> when ≥0.5 or <code>Insufficient signal — treat the cause as a hypothesis.</code> below it — attached ONLY when a cause was attributed (never on recovery legs) and never used to suppress anything (annotation, not a gate). <strong>Accept:</strong> abstention rate rises on thin-signal replays; no raw-text expansion.</p>
+<h3>C6 — Feedback loop + source parity</h3>
+<p><strong>Problem:</strong> no learning from operator split/merge; Alertmanager parity lags Grafana (no value/links). <strong>Change (as-built):</strong> a persisted <code>feedback</code> table (dedupe index on key+action+ref) + admin-gated <code>POST /feedback</code> (<code>confirm_root | split | merge</code>; split requires ref_key; unknown keys refused 404) + read-only <code>GET /feedback.json</code>; corrections aggregate into clamped ±1.0 pair bumps (<code>store.feedback_corrections</code>, 180-day window) consulted by <code>rank_correlated</code>'s <code>corrections</code> param — rank-only on already-gated rows (<code>operator merge/split</code> reason), loaded through a per-gatherer hourly cache in config. Alertmanager adapter gains <code>value</code> / <code>links</code> extras mirroring Grafana (runbook_url/runbook/wiki, values map fallback). The plan's precision/recall + abstention dashboards remain a follow-up (observed correlation outcomes would need a labelled replay corpus first). <strong>Accept:</strong> weight drift bounded (±1) and auditable (every bump traceable to a feedback row); Alertmanager/Grafana extra parity under test.</p>
+
+<h2 id="s8">8. Adversarial review + risks</h2>
+<table>
+<tr><th>Risk</th><th>Why it matters</th><th>Mitigation in this plan</th></tr>
+<tr><td>Raw track leaks to store/logs</td><td>Defeats the entire redaction model; transcripts and dashboards become secret sinks.</td><td>Redacted-only persist/bundle/stats/dashboard; raw is a queue+stack local; fail-closed drains; dedicated leak tests (grep store/overrides/logs for canary secrets).</td></tr>
+<tr><td>Raw reaches a hosted endpoint</td><td>Credential/identifier exfiltration by misconfiguration.</td><td>Knowledge/assist skip-by-default for trusted alerts unless their provider is also trusted; egress-assertion tests; trust toggle confirm + audit.</td></tr>
+<tr><td>Prompt injection laundered as “trusted”</td><td>Log content is attacker-influenced regardless of provider trust.</td><td>Sentinel neutralization + disposition gate + allowlist/caps stay on in both tiers; separate review checklist item.</td></tr>
+<tr><td>Secret in provider URL/headers via JSON</td><td>Env-only rule bypassed through the registry blob.</td><td><code>api_key_ref</code> indirection only; registry blob itself is NEVER-masked; overrides file can never carry it; startup scan rejects inline <code>api_key</code> keys.</td></tr>
+<tr><td>Correlation over-grouping</td><td>Two independent outages fused → wrong root, paged wrong owner.</td><td>Gate unchanged; semantic/topology signals rank-only; strong-label veto; storm-mode fusion tests; precision/recall harness.</td></tr>
+<tr><td>Breaker/metric cardinality</td><td>Per-provider labels can explode series.</td><td>Bounded provider ids (registry size cap, e.g. 16); legacy series kept; dashboard aggregation by plane.</td></tr>
+<tr><td>Digest swallows a real failure (Q2)</td><td>A coalescing window could delay or merge a genuine per-container failure.</td><td>Digest lists every container + version; non-info and failure-marked items bypass immediately; short window; restart fails open.</td></tr>
+<tr><td>Output-shape migration (S-track)</td><td>Headline/body changes ripple to push rules and anything scraping message text.</td><td>Dual-contract release with legacy default; corpus golden diff; version-gated cutover; email HTML keeps both shapes readable.</td></tr>
+<tr><td>Docker socket exposure (Q4)</td><td>Even read-only socket access widens blast radius — and a stock section-proxy still serves GET-only filesystem reads (<code>archive</code>/<code>export</code>).</td><td>Filtering proxy with explicit sub-path denies for <code>archive</code>/<code>export</code> (<code>top</code> unless needed), <code>POST</code> disabled, deny-probes green at acceptance; never the real socket; unreachable proxy degrades to exactly today's behavior.</td></tr>
+<tr><td>Delivered-raw point of no return</td><td>Trust-off cannot claw back already-delivered raw content.</td><td>Documented as accepted risk in P1 §3.2; single-provider soak before widening.</td></tr>
+</table>
+<p><strong>Independent-review disposition</strong> (10 findings; verdict required items 1–4 pre-merge — all folded):</p>
+<table>
+<tr><th>#</th><th>Finding</th><th>Disposition in this plan</th></tr>
+<tr><td>1</td><td>Trust ≠ injection safety; "skip ALL redaction" over-broad</td><td>New §0.4 threat model (three classes, OWASP-grounded mitigations, accepted residual); locked wording kept with boundary pointer</td></tr>
+<tr><td>2</td><td><code>api_key_ref</code> typo → silent unauthenticated</td><td>P0 §1.1: <code>ConfigError</code> for unresolvable ref + non-local URL; warn-only when local</td></tr>
+<tr><td>3</td><td>Trust-flag TOCTOU</td><td>P1 §3.1: captured at ingest, 7th queue-tuple element, engine never re-resolves</td></tr>
+<tr><td>4</td><td>Trusted + hosted endpoint foot-gun</td><td>P1 §3.1: startup WARNING naming provider; egress tests as second layer</td></tr>
+<tr><td>5</td><td>Digest "fail open" first-alert timing</td><td>Q2: first alert immediate, subsequent coalesce into follow-up digest</td></tr>
+<tr><td>6</td><td>Token-Jaccard fragility</td><td>C1: similarity-distribution metric + normalized-case veto tests; embedding upgrade data-driven</td></tr>
+<tr><td>7</td><td>Storm window underspecified</td><td>C4: adaptive <code>(last−first)+30s</code> formula capped at the correlation window</td></tr>
+<tr><td>8</td><td><code>best_display_name()</code> empty fallback</td><td>S §6.2: source → source+category → literal fallback chain</td></tr>
+<tr><td>9</td><td>File index missed Loki twin; proxy underspecified</td><td>Q/S table already lists the Loki twin; no <code>model.py</code> change needed (guard verified correct); Q4 rewritten with sub-path deny requirement</td></tr>
+<tr><td>10</td><td>Rollback granularity; cardinality cap location; no-return undocumented</td><td>P1 §3.2 documents the point of no return; 16-provider cap enforced at config time (P0 §1.1)</td></tr>
+</table>
+<p><strong>As-built review closure (2nd adversarial pass, pre-merge):</strong> 12 findings — 2 HIGH, 5 MED, 5 LOW — all fixed and regression-tested. HIGH-1: a live selector flip could send a queued trusted alert's RAW content to a newly-selected untrusted provider; fixed by pinning <code>provider_at_ingest</code> in the work queue + an engine choke that downgrades to the untrusted path on mismatch, with a dedicated regression test. HIGH-2: unauthenticated <code>/settings.json</code> emitted the raw <code>NUNCIO_PROVIDERS_JSON</code> blob (entry <code>headers</code> may carry credentials); it now emits the structural masked view. MED: entry headers threaded to knowledge/assist builders + the test probe; digest is OFF by default (out-of-band semantics change, opt-in only); C3 learned-edge bump moved inside the gated tier (docs promised rank-only on admitted rows); <code>service_day_rows</code> excludes canaries. LOW: evidence-backed fixes to storm tracker (lock + count-newly-only), digest first-notice accounting + caps, past-incidents cleanup, config dict-key indentation. Full suite green at 95.7% coverage before commit.</p>
+
+<h2 id="s9">9. Test matrix</h2>
+<ul>
+<li><strong>Config:</strong> registry parse/validation (bad JSON, bad URL, bad ref name, unknown selector, assist-without-URL, knowledge-inherit), legacy-seed equivalence, overrides file never contains secret values.</li>
+<li><strong>Masking:</strong> <code>/config.json</code> + <code>/settings.json</code> + startup log show <code>set/unset</code> for keys and registry secrets; selectors plain.</li>
+<li><strong>Redaction split:</strong> canary secrets (key-like, JWT-like, high-entropy) appear verbatim in trusted prompts and delivered detail, but never in store rows, bundles, stats, dashboard payloads, or logs.</li>
+<li><strong>Egress:</strong> hosted knowledge/assist doubles receive zero raw bytes for trusted alerts by default; trusted→trusted legs receive raw.</li>
+<li><strong>Injection:</strong> forged <code>«BUNDLE-START/END»</code> / <code>SEVERITY=</code> / JSON-instruction strings in logs are neutralized in both tiers; disposition gate strips cause/checks on <code>ok/info</code>.</li>
+<li><strong>Breaker:</strong> per-provider trip/cooldown/half-open isolation; selector flip resets capability cache; metrics labels present.</li>
+<li><strong>Correlation:</strong> replay harness (fingerprint stability, gate precision/recall, veto, storm fusion/non-fusion, topology staleness, abstention rate).</li>
+<li><strong>Load:</strong> queue-full + deadline-exceeded paths deliver redacted raw; no raw retention after drain.</li>
+<li><strong>Q-track:</strong> ok/info replay carries zero <code>General guidance</code> blocks with problem-leg output unchanged; burst replay yields 1 digest + 0 queue-sheds with failure bypass and restart fail-open; host <code>-</code> emits no host clause with unit-only recall parity; raw headlines name allowlisted devices with unrelated-secret counts flat.</li>
+<li><strong>S-track:</strong> corpus goldens — entity equals the alert dict on every row (never invented), brief ≤120 chars with severity+entity intact, stub shape on thin rows, legacy/new dual-run clean; forged entity strings neutralized; disposition stub on ok/info.</li>
+</ul>
+
+<h2 id="s10">10. File-change index</h2>
+<table>
+<tr><th>File</th><th>P0</th><th>P1</th><th>C-track</th></tr>
+<tr><td><code>nuncio/config.py</code></td><td>registry schema/validation/masking, selectors, seed migration, rebuild groups, <code>build_app</code> provider map</td><td>trust flag, per-alert classification threading, hosted-leg skip policy</td><td>topology loader wiring</td></tr>
+<tr><td><code>nuncio/engine.py</code></td><td>client/pointer resolution, selector rebuild</td><td>dual-track redact/bundle/prompt/envelope paths, knowledge/assist skip</td><td>storm preamble, past-incident section</td></tr>
+<tr><td><code>nuncio/server.py</code></td><td><code>/providers/{id}/test</code>, selector plumbing</td><td>ingest fork (red/raw), drain fail-closed</td><td>rate tracker (C4)</td></tr>
+<tr><td><code>nuncio/llm.py</code>, <code>circuit.py</code></td><td>factory per provider (cache per client)</td><td>—</td><td>—</td></tr>
+<tr><td><code>nuncio/redactor.py</code></td><td>—</td><td>passthrough posture + <code>insight_trusted</code> separation (keep <code>ScrubbedPayload</code> gate)</td><td>—</td></tr>
+<tr><td><code>nuncio/prompt.py</code>, <code>bundle.py</code>, <code>render.py</code></td><td>—</td><td>raw-variant inputs (caps/order/escaping unchanged)</td><td>new sections (changes, past incidents)</td></tr>
+<tr><td><code>nuncio/web/settings.py</code>, <code>forms.py</code></td><td>providers stage, selector dropdowns, masked registry rows</td><td>trust toggle + confirm + audit</td><td>feedback actions (C6)</td></tr>
+<tr><td><code>nuncio/store.py</code></td><td>—</td><td>redacted-only write assertions</td><td>feedback table, past-incident query</td></tr>
+<tr><td><code>nuncio/correlate.py</code>, <code>collectors.py</code>, <code>gatherer.py</code></td><td>—</td><td>—</td><td>semantic rank (C1), changes section (C2), merged topology (C3), storm (C4)</td></tr>
+<tr><td><code>nuncio/sources/*</code></td><td>—</td><td>—</td><td>Alertmanager parity (C6)</td></tr>
+<tr><td>metrics + <code>web/dashboard.py</code></td><td>provider column in plane info</td><td>per-provider breaker/call series, trust marker</td><td>precision/recall/abstention panels</td></tr>
+<tr><td><code>docs/CONFIGURATION.md</code>, <code>.env.example</code>, tests</td><td>registry reference + migration note</td><td>trust contract + hosted-skip policy + leak/egress tests</td><td>per-phase docs + replay cases</td></tr>
+</table>
+<p><strong>Q/S-track touch-points</strong> (the main table above is unchanged for these):</p>
+<table>
+<tr><th>File</th><th>Q-track</th><th>S-track</th></tr>
+<tr><td><code>nuncio/config.py</code></td><td>Q2 digest-window key only (Q1/Q3 are hard gates, Q5 reuses the existing settings key)</td><td>format-switch default + <code>best_display_name</code> alias table hook (optional, later)</td></tr>
+<tr><td><code>nuncio/engine.py</code></td><td>Q1 garnish gate; Q2 digest assembly + bypass</td><td>deterministic header composer; new-contract threading (after P1 plumbing)</td></tr>
+<tr><td><code>nuncio/server.py</code></td><td>Q2 in-memory coalescing buffer, fail-open</td><td>—</td></tr>
+<tr><td><code>nuncio/clients/logs.py</code> (+ Loki twin)</td><td>Q3 <code>real_host</code> guard on the host clause</td><td>—</td></tr>
+<tr><td><code>nuncio/prompt.py</code>, <code>render.py</code>, <code>envelope.py</code>, <code>delivery/__init__.py</code></td><td>—</td><td>contract swap, header/brief/detail renderers, HTML table variant</td></tr>
+<tr><td><code>nuncio/store.py</code></td><td>Q2 needs no schema (in-memory window)</td><td>golden-corpus queries for the cutover diff</td></tr>
+<tr><td>compose / deploy docs</td><td>Q4 socket-proxy sidecar; Q5 allowlist runbook note</td><td>push-rule update note for the new brief shape</td></tr>
+</table>
+
+<h2 id="s11">11. Acceptance checklists</h2>
+<h3>P0 done when</h3>
+<ul>
+<li>Legacy-only boot and registry boot produce identical prompts/deliveries; full suite green; masked endpoints verified; test endpoint exercises each provider with no alert data.</li>
+</ul>
+<h3>P1 done when</h3>
+<ul>
+<li>Untrusted golden prompts unchanged; trusted prompts carry full data with zero redaction placeholders; every at-rest/read/log surface stays redacted; hosted legs provably receive no raw bytes by default.</li>
+</ul>
+<h3>P2 done when</h3>
+<ul>
+<li>Per-provider breaker/metrics/dashboard live; trust changes confirmed + audited; docs updated; single-trusted-provider soak passes with store-redacted/prompt-raw split verified.</li>
+</ul>
+<h3>C-track done when</h3>
+<ul>
+<li>Each phase ships behind its own flag with replay-harness precision/recall/abstention numbers and a rollback path that restores the deterministic baseline.</li>
+</ul>
+<h3>Q-track done when</h3>
+<ul>
+<li>ok/info garnish is zero with problem legs unchanged; burst replay yields one digest and zero update-attributable queue-sheds; unit-only recall holds without placeholder clauses; raw headlines name devices; the container-visibility decision (proxy or documented deferral) is recorded.</li>
+</ul>
+<h3>S-track done when</h3>
+<ul>
+<li>Corpus goldens pass (entity correctness, brief budget, stub shape); legacy/new dual-run is clean; the default flips with no test changes and push output spot-checked on a live alert of each disposition.</li>
+</ul>
+<hr>
+<p class="small">Implementer note: Q1 + Q3 first (one-condition changes, independent of everything). Then P0 → Q2 → P1 → S-track (needs P1's input-variant plumbing; shares the prompt contract) → P2 → C-phases (C5/C6 touch the same bundle/store surfaces as P1/S). Q4/Q5 are ops-side and can land anytime. Keep every change in the smallest phase that can carry it; if a task needs a secret outside <code>api_key_ref</code>, stop and re-plan.</p>
+</body>
+</html>

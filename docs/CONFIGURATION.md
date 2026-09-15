@@ -13,12 +13,20 @@ The effective configuration (with every secret masked by Nuncio's own redactor) 
 | `NUNCIO_LLM_URL` | *(none — required)* | Base URL of any OpenAI-compatible chat-completions endpoint, e.g. `http://your-llm-gateway:11434/v1`. The `/v1` suffix is the documented convention and is accepted either way — with or without a trailing `/v1`, the client appends `/chat/completions` correctly and never doubles it. |
 | `NUNCIO_LLM_KEY` | `""` | API key / bearer token for `NUNCIO_LLM_URL`, if required. |
 | `NUNCIO_LLM_MODEL` | `default` | Model name/alias requested from `NUNCIO_LLM_URL`. |
+| `NUNCIO_LLM_PROVIDER` | `""` (legacy trio) | Provider id from `NUNCIO_PROVIDERS_JSON` for the private plane (settings-screen editable, live). Entry fields win, with the legacy model/timeout as fallback for fields the entry leaves empty. Entry headers do NOT inherit the legacy headers (headers can carry credentials — an entry states its own). |
+
+### Trusted providers
+
+A registry entry with `"trusted": true` receives the full unredacted alert + context on the private plane (no secret-pattern, entropy, or scrub passes). Trust is env-only (restart to change) — there is deliberately no settings-screen toggle, since flipping trust redefines the data boundary. A trusted flag on a non-local endpoint logs a loud startup warning (raw text will leave the network) but still boots: that is an allowed explicit choice, never an accident.
+
+Mechanics: trust is captured per-alert at ingest and rides the work queue (a live selector flip never re-routes an in-flight alert). Prompts, evidence, and delivered detail carry raw content; the store (bundle audit, stats columns), logs, and dashboard reads stay redacted — raw text never rests. Load-shed/expiry/restart paths always use the redacted copy. A trusted alert skips the knowledge garnish and assist deferral unless that plane's own provider is also trusted. Delivered raw content cannot be clawed back — start with one trusted provider and soak.
 | `NUNCIO_LLM_TIMEOUT_S` | `10.0` | Per-attempt LLM call timeout, in seconds. |
 | `NUNCIO_LLM_MAX_TOKENS` | `400` | Cap on tokens requested from the LLM per enrichment. |
-| `NUNCIO_LLM_CB_FAILS` | `3` | Retryable LLM failures (5xx/429/transport) within the window that trip the enrichment circuit breaker. `0` disables the breaker. |
+| `NUNCIO_LLM_CB_FAILS` | `3` | Retryable LLM failures (5xx/429/transport) within the window that trip the enrichment circuit breaker. `0` disables the breaker. With a provider registry configured, each provider gets its OWN breaker (same knobs for all) — trips/cooldowns are isolated per endpoint and survive selector flips; the unlabelled `nuncio_llm_breaker_*` series tracks the active provider while `nuncio_llm_breaker_*{provider="…"}` covers each registry entry. |
 | `NUNCIO_LLM_CB_WINDOW_S` | `300` | Sliding window (seconds) over which retryable LLM failures are counted. |
 | `NUNCIO_LLM_CB_COOLDOWN_S` | `60` | Time (seconds) the circuit stays open — enrichment fails fast to the raw fallback — before one half-open probe call decides recovery. |
 | `NUNCIO_LLM_HEADERS` | `{}` | Extra HTTP headers sent with every LLM request, as a JSON object string. |
+| `NUNCIO_PROVIDERS_JSON` | `{}` | **Provider registry** (env-only, restart to change): a JSON object mapping a short provider id to `{base_url, model, timeout_s, headers, api_key_ref, trusted}`. Secrets never live here — `api_key_ref` names an environment variable resolved at boot (absent ref = unauthenticated; present-but-unresolvable ref against a non-local endpoint is a fatal `ConfigError`; warn-only when local). At most 16 providers. Per-plane selectors below choose among registry ids; empty selector = the legacy trio on that row. When no registry is configured the providers pane shows the legacy wiring as read-only inventory. |
 
 ## Knowledge plane (optional second LLM)
 
@@ -36,6 +44,7 @@ The effective configuration (with every secret masked by Nuncio's own redactor) 
 | `NUNCIO_KNOWLEDGE_URL` | `""` (inherits `NUNCIO_LLM_URL`) | Base URL. Same `/v1`-tolerant convention as `NUNCIO_LLM_URL`. Only anonymised problem-class strings are ever sent to this endpoint. |
 | `NUNCIO_KNOWLEDGE_KEY` | `""` (inherits `NUNCIO_LLM_KEY`) | API key, if required. Only anonymised problem-class strings are ever sent to this endpoint. |
 | `NUNCIO_KNOWLEDGE_MODEL` | `""` (inherits `NUNCIO_LLM_MODEL`) | Model name/alias. |
+| `NUNCIO_KNOWLEDGE_PROVIDER` | `""` (inherit private plane) | Provider id from `NUNCIO_PROVIDERS_JSON` for the knowledge plane (settings-screen editable, live). Empty preserves the inheritance + redundancy-skip behavior above. |
 
 **Privacy invariant:** Knowledge-plane calls are anonymised: only a generic, identifier-free problem-class description is ever sent — never alert text, hostnames, or any identifier. The ONLY string the knowledge plane can ever receive is the classification table's VALUE for a matched class — never the alert's own text, host, service, output, or the private plane's enrichment. An alert's "class" is its `category` field (an adapter-supplied hint, or the same built-in heuristic — `hardware`/`storage`/`network`/`container`/`generic` — used elsewhere); the classification table's keys should match one of those. An alert whose class isn't in the table, or with the plane disabled, makes zero knowledge-plane calls — there is no code path that can send it raw alert content.
 
@@ -81,6 +90,7 @@ A second, opposite-direction quirk: because the secrets-first pass runs before t
 | `NUNCIO_ASSIST_CONFIRM_EXTERNAL_OK` | `false` | Required (`true`) if `NUNCIO_ASSIST_DATA_POSTURE=scrubbed-real`; irrelevant for the default `generic` posture. |
 | `NUNCIO_ASSIST_SEVERITIES` | `critical` | Comma-separated subset of `critical`\|`warning`\|`info`\|`ok`\|`unknown` — only alerts at one of these severities are ever deferred to the assist plane. |
 | `NUNCIO_ASSIST_TIMEOUT_S` | `60.0` | The assist plane's OWN post-delivery budget, in seconds — entirely separate from `NUNCIO_BUDGET_S`; the assist call never runs inside the 30s alert deadline. |
+| `NUNCIO_ASSIST_PROVIDER` | `""` (legacy trio) | Provider id from `NUNCIO_PROVIDERS_JSON` for the assist plane (settings-screen editable, live). |
 
 ## Delivery
 
@@ -138,6 +148,11 @@ Every delivery attempt is retried by the built-in `Retrying` wrapper; a non-2xx 
 |---|---|---|
 | `NUNCIO_DEFAULT_SOURCE` | `generic` | Source adapter used by `POST /ingest` when the payload doesn't identify its own source. |
 | `NUNCIO_EXTRA_SOURCES` | `""` | Comma-separated Python modules to import at startup, each registering a custom source adapter. |
+| `NUNCIO_DIGEST_WINDOW_S` | `0` | Coalescing window (seconds) for generic info/ok notices sharing a `(source, severity, host)` group: the first notice goes out immediately and enriched; repeats inside the window are terminally recorded and folded into one enriched digest instead of N enrichments. `0` (default) disables — enabling changes delivery semantics for those notices, so it is deliberately opt-in. Criticals/warnings are never held. |
+
+## Queue lanes & recovery cheap path
+
+The work queue is severity-prioritized (critical first, then warning/unknown, info, ok; FIFO within a lane) — during bursts the most urgent alerts enrich first instead of drowning behind recoveries in arrival order. Queue-full still load-sheds to the maintenance raw fallback, unchanged. Recovery (`ok`) notices additionally take the single-call path regardless of the configured depth: the disposition gate discards cause/checks output for recoveries after the model runs, so deep RCA on them is pure waste.
 
 ## Engine & concurrency
 

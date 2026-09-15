@@ -69,7 +69,7 @@ def test_ingest_full_depth_builds_deadline_from_full_budget(tmp_path):
             concurrency=0, queue_max=5, clock=lambda: 1000.0, maint_interval=3600.0)
     a.ingest("checkmk", notify(1))
     item = a.q.get_nowait()
-    key, alert, raw, deadline, mode, depth = item
+    _prio, _seq, key, alert, raw, raw_full, deadline, mode, depth, trusted, provider_at_ingest = item
     assert depth == "full"
     assert deadline._budget == 90.0  # the FULL budget, not the standard 30.0
     store.close()
@@ -82,7 +82,7 @@ def test_ingest_low_depth_builds_deadline_from_standard_budget(tmp_path):
             concurrency=0, queue_max=5, clock=lambda: 1000.0, maint_interval=3600.0)
     a.ingest("checkmk", notify(1))
     item = a.q.get_nowait()
-    key, alert, raw, deadline, mode, depth = item
+    _prio, _seq, key, alert, raw, raw_full, deadline, mode, depth, trusted, provider_at_ingest = item
     assert depth == "low"
     assert deadline._budget == 30.0  # the standard budget, not the full 90.0
     store.close()
@@ -93,7 +93,8 @@ def test_ingest_queue_tuple_defaults_depth_to_full_when_engine_has_no_depth_attr
     # `.depth` -- must degrade to "full" (Engine's own default), never raise.
     app.ingest("checkmk", notify(1))
     item = app.q.get_nowait()
-    assert item[5] == "full"
+    assert item[8] == "full"
+    assert item[9] is False  # default hand-built App is untrusted
 
 
 def test_ingest_computes_and_persists_fingerprint(app):
@@ -897,7 +898,7 @@ def test_worker_skips_row_already_finished_by_a_prior_pass(app):
     # the worker's own guard against reprocessing a row another pass (or
     # the maintenance thread) already finished.
     deadline = Deadline(45.0, clock=app.clock)
-    app.q.put(("checkmk:ghost", {"host": "h"}, "raw", deadline, "enriched", "full"))
+    app.q.put((1, 0, "checkmk:ghost", {"host": "h"}, "raw", None, deadline, "enriched", "full", False, None))
     _run_worker_briefly(app)
     assert app._engine.raw_delivered == []  # process()/`_deliver_raw` never reached
 
@@ -919,7 +920,7 @@ def test_worker_expired_deadline_enriched_mode_delivers_raw_with_deadline_fail_s
 
     app.engine = RecordingEngine()
     app.q.queue.clear()
-    app.q.put((key, {"host": "h"}, "raw", expired, "enriched", "full"))
+    app.q.put((1, 1, key, {"host": "h"}, "raw", None, expired, "enriched", "full", False, None))
     _run_worker_briefly(app)
     assert app.engine.raw_calls == [(key, "deadline")]
     assert app.metrics.failures.get("queue") == 1
@@ -936,13 +937,15 @@ def test_worker_expired_deadline_bypass_mode_still_runs_process(app):
             self.process_calls = []
         def _deliver_raw(self, *a, **k):
             raise AssertionError("bypass has nothing to time out on -- must not take the raw-fallback branch")
-        def process(self, key, alert, raw, deadline=None, mode=None, depth=None):
+
+        def process(self, key, alert, raw, deadline=None, mode=None, depth=None,
+                    trusted=False, raw_full=None, provider_at_ingest=None):
             self.process_calls.append((key, mode))
             return "raw"
 
     app.engine = RecordingEngine()
     app.q.queue.clear()
-    app.q.put((key, {"host": "h"}, "raw", expired, "bypass", "full"))
+    app.q.put((1, 2, key, {"host": "h"}, "raw", None, expired, "bypass", "full", False, None))
     _run_worker_briefly(app)
     assert app.engine.process_calls == [(key, "bypass")]
 
@@ -958,7 +961,7 @@ def test_worker_outcome_delivery_failed_increments_delivery_failure(app):
 
     app.engine = FailingEngine()
     app.q.queue.clear()
-    app.q.put((key, {"host": "h"}, "raw", Deadline(45.0, clock=app.clock), "enriched", "full"))
+    app.q.put((1, 3, key, {"host": "h"}, "raw", None, Deadline(45.0, clock=app.clock), "enriched", "full", False, None))
     _run_worker_briefly(app)
     assert app.metrics.failures.get("delivery") == 1
     assert app.metrics.delivered == {"enriched": 0, "raw": 0}
@@ -975,7 +978,7 @@ def test_worker_survives_engine_exception(app):
 
     app.engine = BoomEngine()
     app.q.queue.clear()
-    app.q.put((key, {"host": "h"}, "raw", Deadline(45.0, clock=app.clock), "enriched", "full"))
+    app.q.put((1, 3, key, {"host": "h"}, "raw", None, Deadline(45.0, clock=app.clock), "enriched", "full", False, None))
     _run_worker_briefly(app)
     assert app.metrics.failures.get("worker") == 1
     assert app.q.qsize() == 0  # task_done still ran (finally block)
@@ -1234,7 +1237,7 @@ def test_worker_skipped_duplicate_outcome_increments_duplicates_avoided_not_deli
 
     app.engine = SkippingEngine()
     app.q.queue.clear()
-    app.q.put((key, {"host": "h"}, "raw", Deadline(45.0, clock=app.clock), "enriched", "full"))
+    app.q.put((1, 3, key, {"host": "h"}, "raw", None, Deadline(45.0, clock=app.clock), "enriched", "full", False, None))
     _run_worker_briefly(app)
     assert app.metrics.duplicates_avoided == 1
     assert app.metrics.delivered == {"enriched": 0, "raw": 0}

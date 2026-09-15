@@ -4,13 +4,18 @@ optional HTML rendering) built ONCE per alert and handed to every configured
 channel. Channels then pick brief vs. full framing (see
 `nuncio/delivery/__init__.py`'s `Dispatch`).
 
-Pure module: only `dataclasses`, `html`, `re`. Every public function is
+Pure module except one import: `real_host` from nuncio.model (stdlib-only,
+no cycle) -- the single codebase-wide placeholder guard, so display names
+can never be built from a "-" host every other layer rejects.
+Every public function is
 wrapped so degenerate/garbage input degrades to a safe default rather than
 raising -- a formatting bug here must never be able to strand an alert.
 """
 import re
 from dataclasses import dataclass
 from html import escape as _html_escape
+
+from nuncio.model import real_host
 
 # severity -> ntfy's 1(min)-5(max) priority header. Canonical home for this
 # table; nuncio/delivery/ntfy.py imports it under its old local name so that
@@ -31,6 +36,49 @@ def severity_symbol(severity) -> str:
         return _SEV_LABEL.get(severity, _SEV_LABEL["unknown"])
     except Exception:
         return _SEV_LABEL["unknown"]
+
+
+def best_display_name(alert) -> str:
+    """Best human-readable "service on host"-style entity for an alert dict
+    (S-track). Skips placeholder/empty/redacted parts via the shared
+    `real_host` guard (a "-" host is not a host); falls back to `source`,
+    then `source + category`, then the literal "alert" -- never empty.
+    Never raises. This replaces LLM-composed identity (docker IDs, None,
+    bare IPs-as-names) with deterministic composition from alert fields."""
+    try:
+        d = alert if isinstance(alert, dict) else {}
+        host = real_host(d.get("host"))
+
+        def _clean(value):
+            try:
+                text = str(value or "").strip()
+            except Exception:
+                return None
+            if not text or text == "-" or text.startswith("«REDACTED"):
+                return None
+            return text
+
+        service = _clean(d.get("service"))
+        if host and service:
+            entity = f"{host}/{service}"
+        elif host:
+            entity = host
+        elif service:
+            entity = service
+        else:
+            source = _clean(d.get("source"))
+            category = _clean(d.get("category"))
+            if source and category:
+                entity = f"{source} {category}"
+            elif source:
+                entity = source
+            else:
+                entity = "alert"
+        if len(entity) > _ENTITY_CAP:
+            entity = entity[:_ENTITY_CAP] + "…"
+        return entity
+    except Exception:
+        return "alert"
 
 _SOFT_CAP = 70
 _HARD_CAP = 120
@@ -97,20 +145,28 @@ def _first_clause(text):
 
 
 def build_headline(severity, host, service, summary_line, raw_first_line=None,
-                    recurrence_count=0, window_label="") -> str:
-    """Build a terse, deterministic one-line headline for an alert."""
+                    recurrence_count=0, window_label="", entity=None) -> str:
+    """Build a terse, deterministic one-line headline for an alert. `entity`,
+    when given (S-track: best_display_name(alert)), replaces the
+    host/service composition -- callers that don't track it pass nothing and
+    get the legacy composition."""
     try:
         sev = _SEV_LABEL.get(severity, _SEV_LABEL["unknown"])
 
-        host = (host or "").strip()
-        service = (service or "").strip()
-        if host and service:
-            entity = f"{host}/{service}"
-        elif host:
-            entity = host
-        elif service:
-            entity = service
-        else:
+        if entity is None:
+            host = (host or "").strip()
+            service = (service or "").strip()
+            if host and service:
+                entity = f"{host}/{service}"
+            elif host:
+                entity = host
+            elif service:
+                entity = service
+            else:
+                entity = ""
+        try:
+            entity = str(entity or "").strip()
+        except Exception:
             entity = ""
         if len(entity) > _ENTITY_CAP:
             entity = entity[:_ENTITY_CAP] + "…"
@@ -150,6 +206,8 @@ _EVIDENCE_LABELS = [
     ("kernel", "Kernel/journal"),
     ("correlated", "Correlated"),
     ("history", "Alert history"),
+    ("changes", "Recent changes"),
+    ("past_incidents", "Similar past incidents"),
     ("recurrence", "Recurrence"),
 ]
 

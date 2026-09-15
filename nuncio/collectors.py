@@ -28,7 +28,8 @@ def _cap_bytes(text, max_bytes):
 
 
 def collect_correlated(store, alert_key, now, window_s=600, limit=20,
-                       alert=None, top_n=8, deps=None, host_domains=()):
+                       alert=None, top_n=8, deps=None, host_domains=(), learned=None,
+                       corrections=None):
     """Other alerts received in the backward window — this is what lets the LLM
     say 'the GPF storm and the postgres wedge are the same box'.
 
@@ -49,7 +50,8 @@ def collect_correlated(store, alert_key, now, window_s=600, limit=20,
         if alert is not None:
             ranked = rank_correlated(rows, alert, tokens=extract_error_tokens(alert),
                                      now=now, window_s=window_s, top_n=top_n, deps=deps,
-                                     host_domains=host_domains)
+                                     host_domains=host_domains, learned=learned,
+                                     corrections=corrections)
             if ranked:
                 return (f"## Correlated alerts (last {mins} min, most related first)\n"
                         + "\n".join(ranked))
@@ -84,6 +86,90 @@ def collect_recurrence(store, alert, now, window_s=172800):
                 f"in {hours}h; first seen {ago}")
     except Exception:
         return UNAVAIL.format("recurrence")
+
+
+# Change-hint keywords matched (case-insensitive substring) against recent
+# payload first-lines. Deliberately narrow stems, not a classifier: every
+# hit is labeled as a keyword hit in the rendered section so the model (and
+# the operator reading the bundle audit) can see exactly why it was
+# included. No hit is ever treated as causal -- this section is context.
+_CHANGE_KEYWORDS = ("updat", "upgrad", "deploy", "restart", "reboot",
+                    "migrat", "firmware", "config change")
+
+
+def collect_changes(store, alert, alert_key, now, window_s=3600, limit=100):
+    """What changed around this alert in the backward window (C2): same-
+    service recent events plus keyword change hints from other services'
+    payloads. Store-only (no network I/O), like recurrence/history --
+    "already-available signals" only, no new feed to configure. Never
+    raises; empty (or store error via UNAVAIL) degrades like every other
+    collector. Results are HINTS, never causal claims (no gate here)."""
+    try:
+        mins = max(1, int(window_s // 60))
+        header = f"## Recent changes (last {mins}m)"
+        rows = store.recent(before=now, window_s=window_s, exclude_key=alert_key, limit=limit)
+        service = (alert.get("service") or "") if isinstance(alert, dict) else ""
+        service_norm = service.strip().lower() or None
+        same, hints, seen_hints = [], [], set()
+        for row in rows or []:
+            try:
+                _key, payload, _created, _src, _cat, _sev, _fp, _host, r_service = row
+            except (TypeError, ValueError):
+                continue
+            first = str(payload or "").splitlines()
+            first = first[0][:160] if first and first[0].strip() else ""
+            if not first:
+                continue
+            if service_norm and str(r_service or "").strip().lower() == service_norm:
+                same.append(first)
+                continue
+            lowered = first.lower()
+            if any(k in lowered for k in _CHANGE_KEYWORDS) and first not in seen_hints:
+                seen_hints.add(first)
+                hints.append(first)
+        lines = []
+        if same:
+            lines.append(f"- {len(same)} same-service event(s); latest: {same[-1]}")
+        for hit in hints[:5]:
+            lines.append(f"- change hint: {hit}")
+        if not lines:
+            return f"{header}\n(no recent changes)"
+        return header + "\n" + "\n".join(lines)
+    except Exception:
+        return UNAVAIL.format("changes")
+
+
+def collect_past_incidents(store, alert, now, limit=3):
+    """C5: previously-RESOLVED instances of this alert's fingerprint as a
+    capped `## Similar past incidents` section -- the RAG source that lets
+    the model cite what actually fixed this exact problem before, instead
+    of re-deriving it. Store-only (free, like recurrence/history); reads
+    ONLY the already-redacted enrichment/payload first lines (rule 1), so
+    it is safe on both trust tiers. Never raises; empty/failure renders the
+    honest empty marker."""
+    try:
+        fp = fingerprint(alert)
+        if not fp:
+            return "## Similar past incidents\n(no past occurrence)"
+        rows = store.past_incidents(fp, limit=limit, now=float(now)) or []
+        if not rows:
+            return "## Similar past incidents\n(no past occurrence)"
+        lines = []
+        for created, _status, first, _pay in rows:
+            try:
+                age_s = max(0.0, float(now) - float(created))
+                if age_s < 3600:
+                    ago = f"{int(age_s // 60)}m ago"
+                elif age_s < 86400:
+                    ago = f"{int(age_s // 3600)}h ago"
+                else:
+                    ago = f"{int(age_s // 86400)}d ago"
+            except (TypeError, ValueError):
+                ago = ""
+            lines.append(f"- {ago}: {first}" if ago else f"- {first}")
+        return "## Similar past incidents\n" + "\n".join(lines)
+    except Exception:
+        return UNAVAIL.format("past_incidents")
 
 
 def _ordinal(n):
@@ -171,7 +257,8 @@ def collect_kernel(log_query, alert, window_s=900, max_lines=50):
 
 
 def collect_history(store, alert_key, now, alert, window_s=86400, back_edge_s=600,
-                     limit=120, top_n=15, deps=None, host_domains=()):
+                     limit=120, top_n=15, deps=None, host_domains=(), learned=None,
+                     corrections=None):
     """Recent-alert-history correlation (Phase B, full depth) -- a WIDER
     backward window than `collect_correlated`'s default, deliberately
     store-only (no network I/O) so even a bare install (all-null collector
@@ -202,7 +289,8 @@ def collect_history(store, alert_key, now, alert, window_s=86400, back_edge_s=60
             return f"{header}\n(no related alerts)"
         ranked = rank_correlated(rows, alert, tokens=extract_error_tokens(alert),
                                  now=now, window_s=window_s, top_n=top_n, deps=deps,
-                                 host_domains=host_domains)
+                                 host_domains=host_domains, learned=learned,
+                                 corrections=corrections)
         if not ranked:
             return f"{header}\n(no related alerts)"
         return header + "\n" + "\n".join(ranked)
