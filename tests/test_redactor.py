@@ -264,6 +264,69 @@ def test_allowlist_is_segment_anchored_not_substring():
         set_allow_keywords([])
 
 
+def test_allowlist_exempts_host_service_composite_via_slash_segment():
+    # Q5: the observed over-redaction class is host/service composites on
+    # piggybacked checks (e.g. `10.13.37.14/Interface`). A `/`-delimited
+    # SERVICE segment equal to a keyword must exempt the composite from the
+    # entropy backstop (the allowlist guards ONLY that backstop).
+    set_allow_keywords(["Interface", "Check_MK"])
+    try:
+        text = "10.13.37.14/Interface 01 - [Port 1], (down)(!!), Admin state: up"
+        out, findings = redact(text)
+        assert "10.13.37.14/Interface" in out
+        assert "«REDACTED" not in out
+        assert any(f["type"] == "entropy_exempt" for f in findings)
+
+        text2 = "10.13.37.20/Check_MK Discovery - Services unmonitored: 1"
+        out2, _ = redact(text2)
+        assert "10.13.37.20/Check_MK" in out2
+        assert "«REDACTED" not in out2
+
+        # A named-pattern secret inside a composite is STILL caught -- the
+        # allowlist never rescues the named rules.
+        secret_text = "10.13.37.14/Interface api_token=abcDEFghiJKLmnoPQRstuVW"
+        out3, _ = redact(secret_text)
+        assert "abcDEFghiJKLmnoPQRstuVW" not in out3
+        assert "«REDACTED" in out3
+    finally:
+        set_allow_keywords([])
+
+
+def test_allowlist_slash_segment_never_exempts_a_bare_secret():
+    # SECURITY: a bare high-entropy secret containing a `/` must NOT be
+    # exempted just because a slice looks like a keyword -- only an EXACT
+    # `/`-delimited segment equal to the keyword counts.
+    set_allow_keywords(["Interface"])
+    try:
+        secret = "Zx7k/qqB3InterfaceYpZ9Q"  # "Interface" is a substring, never a segment
+        out, findings = redact(f"leaked {secret} in log")
+        assert secret not in out
+        assert any(f["type"] == "high_entropy" for f in findings)
+    finally:
+        set_allow_keywords([])
+
+
+def test_allowlist_slash_composite_requires_ip_host():
+    # Review closure: a bare secret that merely ENDS in "/<keyword>" must not
+    # be exempted -- only IP-hosted composites are. Both cases use an exact
+    # "Interface" segment; the difference is the OTHER segment's shape.
+    set_allow_keywords(["Interface"])
+    try:
+        # IP host -> composite exempt (the observed piggybacked-check class)
+        ip_text = "10.13.37.14/Interface 01 - [Port 1], (down)(!!), Admin state: up"
+        out, findings = redact(ip_text)
+        assert "10.13.37.14/Interface" in out
+        assert "«REDACTED" not in out
+
+        # hex-looking secret -> NOT exempt (the redaction-suppression path)
+        secret = "9f8e7d6c5b4a3c2d1e0f/Interface"
+        out2, findings2 = redact(f"leaked {secret} in log")
+        assert secret not in out2
+        assert any(f["type"] == "high_entropy" for f in findings2)
+    finally:
+        set_allow_keywords([])
+
+
 def test_allowlist_matching_is_case_sensitive():
     set_allow_keywords(["PoE"])
     try:
