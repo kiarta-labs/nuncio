@@ -250,12 +250,31 @@ def _looks_secret(tok):
 # because the entropy heuristic alone false-positives on long, high-variety
 # non-secret tokens such as device names (e.g. `USW-Pro-Max-48-PoE-Gen2`).
 #
-# Matching is SEGMENT-ANCHORED and case-sensitive: a token is exempt iff,
-# after splitting it on `-` `.` `_`, some segment is an EXACT match (`==`)
-# for some allow-keyword. A raw substring match was rejected deliberately --
-# it would let a keyword like "U6" ride through a meaningful fraction of
-# random secrets that merely happen to contain that substring; segment
-# anchoring reduces that to effectively zero.
+# Matching is SEGMENT-ANCHORED and case-sensitive. Two shapes:
+#  - Device-name tokens (delimiters `-`/`.`/`_`-free? no -- delimiters are
+#    `-` and `.`): a token is exempt iff some `-`/`.`-delimited segment is
+#    an EXACT match (`==`) for an allow-keyword. This is the legacy behavior
+#    for names like `USW-Pro-Max-48-PoE-Gen2` (any segment hit exempts).
+#  - Host/service composites that contain `/` (e.g. `10.13.37.14/Interface`,
+#    the observed over-redaction class on piggybacked UniFi checks): the
+#    composite is exempt ONLY when at least one segment is a keyword AND
+#    every OTHER segment is IP-shaped. A bare secret that merely ends in
+#    `/<keyword>` (e.g. `9f8e7d6c5b4a3c2d1e0f/Interface`) is NOT exempted --
+#    the strict IP-shape guard keeps the `/`-split from becoming a net
+#    redaction-suppression path (the trade-off is documented, not silent:
+#    `-`/`.` splits were already additive, `/` adds surface ONLY for
+#    IP-hosted composites).
+# A raw substring match was rejected deliberately -- it would let a keyword
+# like "U6" ride through a meaningful fraction of random secrets that merely
+# happen to contain that substring; segment anchoring reduces that to
+# effectively zero. `_` is deliberately NOT a delimiter: underscores are part
+# of many identifiers (e.g. `Check_MK`), so splitting on them would make an
+# underscore-bearing keyword unmatchable; keeping them out of the delimiters
+# is also the more conservative choice (exempts fewer tokens).
+# Named-pattern rules (kv_secret, env, api_key, ...) always run BEFORE the
+# entropy pass and insert `«REDACTED:...»` placeholders, so the allowlist can
+# never rescue a token already caught by a named rule -- this exemption only
+# ever guards the entropy backstop.
 #
 # Rebuilt as a brand-new list object on every change (never mutated in
 # place), same discipline as _EXTRA_RULES above, so a concurrent redact()
@@ -300,8 +319,24 @@ def get_allow_keywords():
     return list(_ALLOW_KEYWORDS)
 
 
+_IP_SEGMENT_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+
 def _is_allowlisted(tok):
-    segments = re.split(r"[-._]", tok)
+    """Segment-anchored exemption from the entropy backstop -- see the
+    block comment above the class for the exact (device-name vs
+    host/service-composite) rules and the IP-shape guard."""
+    if "/" in tok:
+        # Host/service composite: split on "/" ONLY so an IPv4 host stays a
+        # single segment (`10.13.37.14/Interface` -> `10.13.37.14`,
+        # `Interface`); a bare secret that merely ends in `/<keyword>` has a
+        # non-IP other segment and is never exempted.
+        segments = tok.split("/")
+        others = [seg for seg in segments if seg not in _ALLOW_KEYWORDS]
+        if not any(seg in _ALLOW_KEYWORDS for seg in segments):
+            return False
+        return bool(others) and all(_IP_SEGMENT_RE.match(seg) for seg in others)
+    segments = re.split(r"[-.]", tok)
     return any(seg in _ALLOW_KEYWORDS for seg in segments)
 
 
