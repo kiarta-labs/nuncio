@@ -98,7 +98,9 @@ A second, opposite-direction quirk: because the secrets-first pass runs before t
 |---|---|---|
 | `NUNCIO_DELIVERY` | `stdout` | Comma-separated adapter names to fan out to: `stdout`, `apprise`, `ntfy`, `telegram`, `slack`, `webhook`, `email`. |
 | `NUNCIO_DELIVERY_TITLE` | `Nuncio alert` | Deprecated/unused as of v0.3.0 -- titles are now built from each alert's headline (`nuncio.envelope.build_headline`). Kept settable, never consulted. |
-| `NUNCIO_APPRISE_URL` | `""` | Apprise gateway notify URL. |
+| `NUNCIO_APPRISE_URL` | `""` | Apprise gateway notify URL (`/notify/<key>`, optionally `?tag=<tag>`). Don't embed credentials; use the two settings below. |
+| `NUNCIO_APPRISE_USER` | `""` | Apprise API login user, sent as HTTP Basic auth, for an API that requires a login. |
+| `NUNCIO_APPRISE_PASSWORD` | `""` | Apprise API login password. |
 | `NUNCIO_NTFY_URL` | `""` | ntfy server URL. |
 | `NUNCIO_NTFY_TOPIC` | `""` | ntfy topic. |
 | `NUNCIO_NTFY_TOKEN` | `""` | ntfy access token, if the topic is protected. |

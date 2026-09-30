@@ -95,6 +95,8 @@ _SCHEMA = {
     "NUNCIO_ASSIST_PROVIDER": ("", str),
     "NUNCIO_DELIVERY": ("stdout", str),
     "NUNCIO_APPRISE_URL": ("", str),
+    "NUNCIO_APPRISE_USER": ("", str),
+    "NUNCIO_APPRISE_PASSWORD": ("", str),
     "NUNCIO_NTFY_URL": ("", str),
     "NUNCIO_NTFY_TOPIC": ("", str),
     "NUNCIO_NTFY_TOKEN": ("", str),
@@ -299,6 +301,11 @@ UI_EDITABLE = {
     # see the settings-screen security posture note at the top of this file.
     "NUNCIO_APPRISE_URL": _spec("NUNCIO_APPRISE_URL", category="live", type="str", secret=True, group="delivery",
                                 label="Apprise URL"),
+    "NUNCIO_APPRISE_USER": _spec("NUNCIO_APPRISE_USER", category="live", type="str", secret=True, group="delivery",
+                                 label="Apprise login user",
+                                 help="HTTP Basic auth, for an Apprise API that requires a login."),
+    "NUNCIO_APPRISE_PASSWORD": _spec("NUNCIO_APPRISE_PASSWORD", category="live", type="str", secret=True,
+                                     group="delivery", label="Apprise login password"),
     "NUNCIO_NTFY_URL": _spec("NUNCIO_NTFY_URL", category="live", type="str", group="delivery", label="ntfy server URL"),
     "NUNCIO_NTFY_TOPIC": _spec("NUNCIO_NTFY_TOPIC", category="live", type="str", secret=True, group="delivery",
                                label="ntfy topic"),
@@ -1334,7 +1341,8 @@ _ASSIST_KEYS = frozenset({
     "NUNCIO_ASSIST_PROVIDER",
 })
 _DELIVERY_KEYS = frozenset({
-    "NUNCIO_DELIVERY", "NUNCIO_APPRISE_URL", "NUNCIO_NTFY_URL", "NUNCIO_NTFY_TOPIC", "NUNCIO_NTFY_TOKEN",
+    "NUNCIO_DELIVERY", "NUNCIO_APPRISE_URL", "NUNCIO_APPRISE_USER", "NUNCIO_APPRISE_PASSWORD",
+    "NUNCIO_NTFY_URL", "NUNCIO_NTFY_TOPIC", "NUNCIO_NTFY_TOKEN",
     "NUNCIO_TELEGRAM_BOT_TOKEN", "NUNCIO_TELEGRAM_CHAT_ID", "NUNCIO_SLACK_WEBHOOK_URL",
     "NUNCIO_WEBHOOK_URL", "NUNCIO_WEBHOOK_HEADERS", "NUNCIO_WEBHOOK_TEMPLATE", "NUNCIO_DELIVERY_TITLE",
     "NUNCIO_EMAIL_SMTP_HOST", "NUNCIO_EMAIL_SMTP_PORT", "NUNCIO_EMAIL_USER", "NUNCIO_EMAIL_PASSWORD",
@@ -1693,7 +1701,8 @@ def _delivery_cfg_by_name(settings):
     # transport at all, so neither carries a "timeout" key here.
     http_timeout = settings.NUNCIO_DELIVERY_TIMEOUT_S
     return {
-        "apprise": {"url": settings.NUNCIO_APPRISE_URL, "timeout": http_timeout},
+        "apprise": {"url": settings.NUNCIO_APPRISE_URL, "user": settings.NUNCIO_APPRISE_USER,
+                    "password": settings.NUNCIO_APPRISE_PASSWORD, "timeout": http_timeout},
         "ntfy": {"url": settings.NUNCIO_NTFY_URL, "topic": settings.NUNCIO_NTFY_TOPIC,
                  "token": settings.NUNCIO_NTFY_TOKEN or None, "timeout": http_timeout},
         "telegram": {"bot_token": settings.NUNCIO_TELEGRAM_BOT_TOKEN,

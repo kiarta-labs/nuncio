@@ -23,21 +23,27 @@ The file name (without extension) is the method name CheckMK shows in the UI.
 ## Configure a notification rule
 
 In **Setup → Notifications**, add a rule with the notification method
-`notify_nuncio` and up to three parameters:
+`notify_nuncio` and up to five parameters:
 
 | Parameter | Meaning | Example |
 |-----------|---------|---------|
 | 1 | Nuncio base URL | `http://nuncio:8095` |
 | 2 | Nuncio ingest token (sent as `X-Auth-Token`) | *(your `NUNCIO_INGEST_TOKEN`)* |
 | 3 | Apprise fallback URL (raw alert on Nuncio failure) | `http://apprise:8000/notify/checkmk` |
+| 4 | Apprise fallback login user (HTTP Basic auth) | *(only if your Apprise API requires a login)* |
+| 5 | Apprise fallback login password | |
 
-Parameter 1 defaults to `http://nuncio:8095` if omitted. Parameters 2 and 3 are
+Parameter 1 defaults to `http://nuncio:8095` if omitted. Parameters 2 to 5 are
 optional; without a fallback URL the plugin simply reports failure to CheckMK
-if Nuncio is unreachable.
+if Nuncio is unreachable. Append `?tag=<tag>` to the fallback URL if the Apprise
+key's configuration is tagged.
 
 ## What gets sent
 
 The plugin forwards every `NOTIFY_*` environment variable CheckMK provides to
-`POST /ingest/checkmk` as a JSON object. Nuncio's `checkmk` source adapter
+`POST /ingest/checkmk` as a JSON object, except the rule's own parameters
+(`NOTIFY_PARAMETER_<n>` and `NOTIFY_PARAMETERS`), which hold the token and the
+Apprise login. The same filtered object is what gets written to the local
+spool when delivery fails. Nuncio's `checkmk` source adapter
 derives a stable idempotency key (host / service / problem id / notification
 type / number) and a structured alert from those fields.

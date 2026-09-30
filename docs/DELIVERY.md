@@ -61,6 +61,12 @@ Whatever config keys your adapter needs, thread them through `nuncio/config.py`'
 
 Inject a fake transport instead of hitting the network — see `tests/test_delivery_*.py` for the pattern used by the built-in adapters (each one accepts an optional `transport` callable in its constructor for exactly this purpose). The email adapter instead accepts a `smtp_factory` (see `tests/test_delivery_email.py`).
 
+## Apprise adapter
+
+`NUNCIO_DELIVERY=apprise` POSTs `{"title", "body"}` to an [Apprise API](https://github.com/caronc/apprise-api) stateful notify URL, `NUNCIO_APPRISE_URL` (`http://apprise:8000/notify/<key>`). A 204 counts as failure (see above). If the key's configuration is tagged, append `?tag=<tag>` to the URL; the API reads the tag from the query string as well as from the body.
+
+If the API requires a login (`APPRISE_AUTH_REQUIRED=yes`, or a key with its own `user`/`locked` access mode in Apprise API 2.x), set `NUNCIO_APPRISE_USER` and `NUNCIO_APPRISE_PASSWORD`. They are sent as HTTP Basic auth (UTF-8, RFC 7617); with both empty no `Authorization` header is sent. Keep credentials out of the URL itself: `urllib` does not turn `user:pass@host` into a login. Basic auth over plain `http://` is readable by anything on the path, so keep the Apprise API on a private network or put it behind `https://`.
+
 ## Email adapter
 
 `NUNCIO_DELIVERY=email` sends via plain `smtplib`/`email.message.EmailMessage`, stdlib only: `NUNCIO_EMAIL_SMTP_HOST`, `NUNCIO_EMAIL_SMTP_PORT` (587), `NUNCIO_EMAIL_USER`/`NUNCIO_EMAIL_PASSWORD` (login skipped if either is empty), `NUNCIO_EMAIL_FROM`, `NUNCIO_EMAIL_TO` (comma-separated), `NUNCIO_EMAIL_TLS` (`starttls` default, `ssl`, or `none`). The subject line has `\r`/`\n` stripped as a header-injection guard. When the envelope carries an HTML rendering it's attached as a `multipart/alternative` part alongside the plain-text body.

@@ -6,6 +6,7 @@ adapter's own request-shaping/response-interpretation logic from the network;
 this file is the one place the actual stdlib call path
 (`urllib.request.urlopen` / `smtplib.SMTP`) gets exercised, with the socket
 layer itself faked out."""
+import base64
 import json
 
 import nuncio.delivery.apprise as apprise_mod
@@ -47,6 +48,18 @@ def test_apprise_default_transport_posts_and_returns_status(monkeypatch):
     req = captured[0]
     assert req.full_url == "http://apprise:8000/notify/alerts"
     assert json.loads(req.data.decode()) == {"body": "body", "title": "title"}
+
+
+def test_apprise_default_transport_sends_basic_auth_and_keeps_content_type(monkeypatch):
+    captured = []
+    _patch_urlopen(monkeypatch, apprise_mod, _FakeResponse(200), captured)
+    a = apprise_mod.Apprise({"url": "http://apprise:8000/notify/alerts?tag=alerts",
+                             "user": "nuncio", "password": "s3cret"})
+    assert a.send("title", "body") is True
+    req = captured[0]
+    assert req.full_url == "http://apprise:8000/notify/alerts?tag=alerts"
+    assert req.get_header("Authorization") == "Basic " + base64.b64encode(b"nuncio:s3cret").decode()
+    assert req.get_header("Content-type") == "application/json"
 
 
 def test_slack_default_transport_posts_and_returns_status(monkeypatch):

@@ -22,10 +22,16 @@ Then create a notification rule (Setup > Notifications) using the method
                                          alert is delivered here if Nuncio is
                                          unreachable, e.g.
                                          http://apprise:8000/notify/checkmk)
+    Parameter 4  Apprise fallback user  (optional; HTTP Basic auth, for an
+                                         Apprise API that requires a login)
+    Parameter 5  Apprise fallback password (optional; with Parameter 4)
 
 It reads the standard NOTIFY_* environment variables CheckMK passes in and
-forwards all of them to Nuncio as a JSON object. Nuncio's "checkmk" source
-adapter derives a stable idempotency key and a structured alert from them.
+forwards them to Nuncio as a JSON object -- all except the rule's own
+parameters (NOTIFY_PARAMETER_<n>, NOTIFY_PARAMETERS), which carry the token
+and login above and are plugin configuration, not alert data. Nuncio's
+"checkmk" source adapter derives a stable idempotency key and a structured
+alert from them.
 
 This module runs inside CheckMK's own bundled Python and therefore cannot
 import the `nuncio` package -- it carries small self-contained copies of the
@@ -43,6 +49,7 @@ before handling its own new notification, so a later, healthy run finishes
 the delivery. This is what makes it safe to route notifications through
 Nuncio even though CheckMK RAW itself gives no delivery guarantee.
 """
+import base64
 import json
 import os
 import re
@@ -229,7 +236,18 @@ def spool_list(directory, limit=None):
     return [os.path.join(directory, n) for n in names]
 
 
-def spool_drain(directory, nuncio_url, ingest_token, fallback_url, timeout=10, limit=20):
+def apprise_headers(user, password):
+    """Headers for the Apprise fallback POST: JSON, plus HTTP Basic auth when
+    a login is configured (Parameters 4/5). RFC 7617: UTF-8, then base64."""
+    headers = {"Content-Type": "application/json"}
+    if user or password:
+        raw = "{}:{}".format(user, password).encode("utf-8")
+        headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+    return headers
+
+
+def spool_drain(directory, nuncio_url, ingest_token, fallback_url, timeout=10, limit=20,
+                fallback_user="", fallback_password=""):
     """Attempt to redeliver every spooled alert in `directory` (bounded by
     `limit` so a single notify invocation can't hang draining a large
     backlog): re-POST to Nuncio, else to Apprise. Delete the file on a 2xx
@@ -266,7 +284,7 @@ def spool_drain(directory, nuncio_url, ingest_token, fallback_url, timeout=10, l
                 code = post(fallback_url,
                              {"title": record.get("title", ""), "body": record.get("body", ""),
                               "type": record.get("kind", "info")},
-                             {"Content-Type": "application/json"}, timeout)
+                             apprise_headers(fallback_user, fallback_password), timeout)
                 delivered = 200 <= code < 300
             except Exception:  # noqa: BLE001
                 delivered = False
@@ -284,6 +302,8 @@ def main():
     nuncio_url = (env("NOTIFY_PARAMETER_1") or "http://nuncio:8095").rstrip("/")
     ingest_token = env("NOTIFY_PARAMETER_2")
     fallback_url = env("NOTIFY_PARAMETER_3")
+    fallback_user = env("NOTIFY_PARAMETER_4")
+    fallback_password = env("NOTIFY_PARAMETER_5")
 
     if not fallback_url:
         # Missing safety net: make this loudly visible in CheckMK's
@@ -297,15 +317,19 @@ def main():
     directory = spool_dir()
     if directory:
         try:
-            drained = spool_drain(directory, nuncio_url, ingest_token, fallback_url)
+            drained = spool_drain(directory, nuncio_url, ingest_token, fallback_url,
+                                  fallback_user=fallback_user, fallback_password=fallback_password)
             if drained:
                 print("Spool drain: redelivered {} alert(s)".format(drained))
         except Exception as exc:  # noqa: BLE001 -- draining must never block delivery
             print("Spool drain failed: {}".format(exc))
 
     # Forward every NOTIFY_* variable verbatim; the adapter reads the subset
-    # it needs and keeps the rest available as raw context.
-    notification = {k: v for k, v in os.environ.items() if k.startswith("NOTIFY_")}
+    # it needs and keeps the rest available as raw context. The rule's own
+    # parameters are excluded: they hold the ingest token and the Apprise
+    # login, and this dict is both the Nuncio request body and the spool file.
+    notification = {k: v for k, v in os.environ.items()
+                    if k.startswith("NOTIFY_") and not k.startswith("NOTIFY_PARAMETER")}
 
     # --- Primary path: hand the notification to Nuncio ---------------------
     headers = {"Content-Type": "application/json"}
@@ -336,7 +360,7 @@ def main():
     if fallback_url:
         try:
             code = post(fallback_url, {"title": title, "body": body, "type": kind},
-                        {"Content-Type": "application/json"}, 10)
+                        apprise_headers(fallback_user, fallback_password), 10)
             print("Apprise fallback -> HTTP {}".format(code))
             if 200 <= code < 300:
                 return 0

@@ -3,7 +3,9 @@
 configured" signal) is correctly treated as delivery failure, not success —
 trusting it as success would silently black-hole every alert. Covers a
 single delivery attempt; retry behavior lives in Retrying, tested
-separately."""
+separately. Also covers HTTP Basic auth for an Apprise API that requires
+a login (APPRISE_AUTH_REQUIRED)."""
+import base64
 import socket
 import urllib.error
 
@@ -18,8 +20,8 @@ class Transport:
         self.statuses = list(statuses)
         self.calls = []
 
-    def __call__(self, url, payload, timeout=10):
-        self.calls.append((url, payload, timeout))
+    def __call__(self, url, payload, headers, timeout=10):
+        self.calls.append((url, payload, headers, timeout))
         return self.statuses[len(self.calls) - 1]
 
 
@@ -50,7 +52,7 @@ def test_204_no_destination_is_treated_as_failure():
 def test_payload_carries_title_and_body():
     a, t = make([200])
     a.send("the title", "the message body")
-    _, payload, _ = t.calls[0]
+    _, payload, _, _ = t.calls[0]
     assert payload == {"body": "the message body", "title": "the title"}
 
 
@@ -61,7 +63,7 @@ def test_no_url_configured_fails_closed_without_transport_call():
 
 
 def test_transport_exception_propagates_for_retrying_to_catch():
-    def boom(url, payload, timeout=10):
+    def boom(url, payload, headers, timeout=10):
         raise ConnectionError("down")
     a = Apprise({"url": "http://x"}, transport=boom)
     import pytest
@@ -75,7 +77,7 @@ def test_socket_timeout_raises_send_timeout_not_the_raw_exception():
     # timeout is non-idempotent and may already have reached Apprise/Bark
     # (the 4x-duplicate-push bug). The adapter must surface a distinct,
     # typed SendTimeout so the caller can choose not to retry it.
-    def boom(url, payload, timeout=10):
+    def boom(url, payload, headers, timeout=10):
         raise socket.timeout("timed out")
     a = Apprise({"url": "http://x"}, transport=boom)
     with pytest.raises(SendTimeout):
@@ -83,7 +85,7 @@ def test_socket_timeout_raises_send_timeout_not_the_raw_exception():
 
 
 def test_urlerror_wrapping_a_timeout_reason_raises_send_timeout():
-    def boom(url, payload, timeout=10):
+    def boom(url, payload, headers, timeout=10):
         raise urllib.error.URLError(socket.timeout("timed out"))
     a = Apprise({"url": "http://x"}, transport=boom)
     with pytest.raises(SendTimeout):
@@ -93,7 +95,7 @@ def test_urlerror_wrapping_a_timeout_reason_raises_send_timeout():
 def test_connection_error_still_propagates_as_itself_not_send_timeout():
     # Connection-refused/5xx-shaped failures are NOT timeouts -- Retrying
     # must keep retrying those as today, so they must not be reclassified.
-    def boom(url, payload, timeout=10):
+    def boom(url, payload, headers, timeout=10):
         raise ConnectionError("down")
     a = Apprise({"url": "http://x"}, transport=boom)
     with pytest.raises(ConnectionError):
@@ -104,7 +106,7 @@ def test_timeout_config_reaches_the_transport_call():
     a, t = make([200])
     a2 = Apprise({"url": "http://x", "timeout": 45}, transport=t)
     a2.send("t", "b")
-    _, _, used_timeout = t.calls[0]
+    _, _, _, used_timeout = t.calls[0]
     assert used_timeout == 45
 
 
@@ -120,3 +122,37 @@ def test_send_rejects_non_http_scheme(monkeypatch):
         assert not a.send("t", "b")
     except ValueError:
         pass  # raise is caught by Retrying / existing failure handling
+
+
+def _basic(user, password):
+    raw = f"{user}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+def test_basic_auth_header_sent_when_credentials_configured():
+    # An Apprise API running with APPRISE_AUTH_REQUIRED answers 401 to an
+    # unauthenticated /notify, so the adapter must be able to log in.
+    t = Transport([200])
+    a = Apprise({"url": "http://apprise:8000/notify/alerts?tag=alerts",
+                 "user": "nuncio", "password": "s3cret"}, transport=t)
+    assert a.send("t", "b") is True
+    url, _, headers, _ = t.calls[0]
+    assert headers["Authorization"] == _basic("nuncio", "s3cret")
+    assert url == "http://apprise:8000/notify/alerts?tag=alerts"
+
+
+def test_no_authorization_header_without_credentials():
+    a, t = make([200])
+    a.send("t", "b")
+    _, _, headers, _ = t.calls[0]
+    assert "Authorization" not in headers
+
+
+def test_basic_auth_credentials_are_utf8_encoded():
+    # RFC 7617: the user-pass is encoded as UTF-8 before base64.
+    t = Transport([200])
+    a = Apprise({"url": "http://x", "user": "nüncio", "password": "pässwörd"}, transport=t)
+    a.send("t", "b")
+    _, _, headers, _ = t.calls[0]
+    assert headers["Authorization"] == _basic("nüncio", "pässwörd")
+

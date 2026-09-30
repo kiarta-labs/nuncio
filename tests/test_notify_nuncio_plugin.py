@@ -5,6 +5,7 @@ copy of the unexpanded-macro scrub and severity-emoji mapping. These tests
 exercise the plugin's pure helper functions directly (imported by file path,
 since `integrations/checkmk/` is not a package on sys.path).
 """
+import base64
 import importlib.util
 import json
 import os
@@ -200,9 +201,13 @@ class FakeTransport:
         self.nuncio_ok = nuncio_ok
         self.apprise_ok = apprise_ok
         self.calls = []
+        self.headers = []
+        self.payloads = []
 
     def __call__(self, url, payload, headers, timeout):
         self.calls.append(url)
+        self.headers.append(dict(headers))
+        self.payloads.append(payload)
         if "/ingest/checkmk" in url:
             if self.nuncio_ok:
                 return 200
@@ -390,3 +395,96 @@ def test_main_build_fallback_exception_still_reaches_spool(tmp_path, monkeypatch
 
     assert rc == 0
     assert len(notify_nuncio.spool_list(str(tmp_path))) == 1
+
+
+# --- rule parameters are plugin config (URLs, token, login), never alert data ---
+
+def test_main_does_not_forward_rule_parameters_to_nuncio(tmp_path, monkeypatch):
+    # CheckMK exports the rule's parameters as NOTIFY_PARAMETER_<n> plus
+    # NOTIFY_PARAMETERS (all of them, space-joined); they hold the ingest
+    # token and the Apprise login and must not travel in the alert body.
+    monkeypatch.setenv("NUNCIO_PLUGIN_SPOOL_DIR", str(tmp_path))
+    _notify_env(monkeypatch, NOTIFY_PARAMETER_2="ingest-tok", NOTIFY_PARAMETER_5="s3cret",
+                NOTIFY_PARAMETERS="http://nuncio:8095 ingest-tok x cmk s3cret")
+    t = FakeTransport(nuncio_ok=True, apprise_ok=True)
+    monkeypatch.setattr(notify_nuncio, "post", t)
+
+    assert notify_nuncio.main() == 0
+    body = t.payloads[0]
+    assert body["NOTIFY_HOSTNAME"] == "spool-host"
+    assert not [k for k in body if k.startswith("NOTIFY_PARAMETER")]
+
+
+# --- Apprise fallback login (Parameters 4/5) ---
+
+_EXPECTED_BASIC = "Basic " + base64.b64encode(b"cmk:s3cret").decode("ascii")
+
+
+def test_main_apprise_fallback_logs_in_when_credentials_configured(tmp_path, monkeypatch):
+    # An Apprise API that requires a login answers 401 to an anonymous POST,
+    # which would push every Nuncio-outage alert into the spool.
+    monkeypatch.setenv("NUNCIO_PLUGIN_SPOOL_DIR", str(tmp_path))
+    _notify_env(monkeypatch)
+    monkeypatch.setenv("NOTIFY_PARAMETER_3", "http://apprise:8000/notify/fallback?tag=checkmk")
+    monkeypatch.setenv("NOTIFY_PARAMETER_4", "cmk")
+    monkeypatch.setenv("NOTIFY_PARAMETER_5", "s3cret")
+    t = FakeTransport(nuncio_ok=False, apprise_ok=True)
+    monkeypatch.setattr(notify_nuncio, "post", t)
+
+    assert notify_nuncio.main() == 0
+    assert t.calls[-1] == "http://apprise:8000/notify/fallback?tag=checkmk"
+    assert t.headers[-1]["Authorization"] == _EXPECTED_BASIC
+    assert t.headers[-1]["Content-Type"] == "application/json"
+
+
+def test_main_never_sends_apprise_credentials_to_nuncio(tmp_path, monkeypatch):
+    monkeypatch.setenv("NUNCIO_PLUGIN_SPOOL_DIR", str(tmp_path))
+    _notify_env(monkeypatch)
+    monkeypatch.setenv("NOTIFY_PARAMETER_3", "http://apprise:8000/notify/fallback")
+    monkeypatch.setenv("NOTIFY_PARAMETER_4", "cmk")
+    monkeypatch.setenv("NOTIFY_PARAMETER_5", "s3cret")
+    t = FakeTransport(nuncio_ok=False, apprise_ok=True)
+    monkeypatch.setattr(notify_nuncio, "post", t)
+
+    notify_nuncio.main()
+    nuncio_legs = [h for u, h in zip(t.calls, t.headers) if "/ingest/checkmk" in u]
+    assert nuncio_legs and all("Authorization" not in h for h in nuncio_legs)
+
+
+def test_main_apprise_fallback_sends_no_authorization_without_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("NUNCIO_PLUGIN_SPOOL_DIR", str(tmp_path))
+    _notify_env(monkeypatch)
+    monkeypatch.setenv("NOTIFY_PARAMETER_3", "http://apprise:8000/notify/checkmk")
+    t = FakeTransport(nuncio_ok=False, apprise_ok=True)
+    monkeypatch.setattr(notify_nuncio, "post", t)
+
+    assert notify_nuncio.main() == 0
+    assert "Authorization" not in t.headers[-1]
+
+
+def test_spool_drain_apprise_leg_logs_in_when_credentials_given(tmp_path, monkeypatch):
+    record = {"key_hint": "h", "notification": {"NOTIFY_HOSTNAME": "h"},
+              "title": "t", "body": "b", "kind": "failure"}
+    notify_nuncio.spool_write(str(tmp_path), record)
+    t = FakeTransport(nuncio_ok=False, apprise_ok=True)
+    monkeypatch.setattr(notify_nuncio, "post", t)
+    drained = notify_nuncio.spool_drain(str(tmp_path), "http://nuncio:8095", "",
+                                        "http://apprise/notify", timeout=1, limit=10,
+                                        fallback_user="cmk", fallback_password="s3cret")
+    assert drained == 1
+    assert t.headers[-1]["Authorization"] == _EXPECTED_BASIC
+
+
+def test_spooled_record_never_contains_apprise_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("NUNCIO_PLUGIN_SPOOL_DIR", str(tmp_path))
+    _notify_env(monkeypatch)
+    monkeypatch.setenv("NOTIFY_PARAMETER_3", "http://apprise:8000/notify/fallback")
+    monkeypatch.setenv("NOTIFY_PARAMETER_4", "cmk")
+    monkeypatch.setenv("NOTIFY_PARAMETER_5", "s3cret")
+    monkeypatch.setattr(notify_nuncio, "post", FakeTransport(nuncio_ok=False, apprise_ok=False))
+
+    assert notify_nuncio.main() == 0
+    files = notify_nuncio.spool_list(str(tmp_path))
+    assert len(files) == 1
+    with open(files[0], encoding="utf-8") as f:
+        assert "s3cret" not in f.read()

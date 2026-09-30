@@ -5,7 +5,13 @@ Speaks Apprise's `/notify/<key>` webhook contract: `{"body", "title"}`.
 Apprise returns 204 when the configured key has NO destination configured —
 nothing was actually pushed — so a 204 counts as FAILURE here (never trust it
 as success, or a mis-keyed config silently black-holes every alert).
+
+`cfg`: `url` (e.g. http://apprise:8000/notify/<key>, optionally `?tag=<tag>`),
+optional `user`/`password` -- sent as HTTP Basic auth, for an Apprise API
+that requires a login (APPRISE_AUTH_REQUIRED, or a key with its own access
+mode). The URL itself must not carry credentials.
 """
+import base64
 import json
 import socket
 import urllib.error
@@ -14,11 +20,11 @@ import urllib.request
 from nuncio.delivery import DeliveryAdapter, SendTimeout, register, require_http_url
 
 
-def _urllib_transport(url, payload, timeout=10):
+def _urllib_transport(url, payload, headers, timeout=10):
     require_http_url(url)
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+        url, data=data, headers={"Content-Type": "application/json", **headers}, method="POST"
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status
@@ -39,6 +45,13 @@ class Apprise(DeliveryAdapter):
     def __init__(self, cfg=None, transport=None, timeout=10):
         cfg = cfg or {}
         self.url = cfg.get("url") or None
+        user = cfg.get("user") or ""
+        password = cfg.get("password") or ""
+        self._headers = {}
+        if user or password:
+            # RFC 7617: user-pass is UTF-8 encoded, then base64.
+            token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+            self._headers["Authorization"] = f"Basic {token}"
         self._transport = transport or _urllib_transport
         self.timeout = cfg.get("timeout", timeout)
 
@@ -47,7 +60,7 @@ class Apprise(DeliveryAdapter):
             return False
         payload = {"body": body, "title": title}
         try:
-            status = self._transport(self.url, payload, self.timeout)
+            status = self._transport(self.url, payload, self._headers, self.timeout)
         except Exception as e:
             # A timeout is reclassified to a typed, distinct exception --
             # see SendTimeout's docstring for why Retrying must not treat it

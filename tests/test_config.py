@@ -500,6 +500,47 @@ def test_build_delivery_wires_timeout_into_apprise_adapter():
     assert retrying.adapter.timeout == 45.0
 
 
+def test_build_delivery_wires_apprise_credentials_into_the_request(monkeypatch):
+    import base64
+
+    import nuncio.delivery.apprise as apprise_mod
+
+    captured = []
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=10):
+        captured.append(req)
+        return _Resp()
+
+    monkeypatch.setattr(apprise_mod.urllib.request, "urlopen", fake_urlopen)
+    s = config.load_settings(base_env(NUNCIO_DELIVERY="apprise",
+                                       NUNCIO_APPRISE_URL="http://apprise:8000/notify/x?tag=alerts",
+                                       NUNCIO_APPRISE_USER="nuncio", NUNCIO_APPRISE_PASSWORD="s3cret"))
+    d = config.build_delivery(s)
+    assert d.send(_envelope()) is True
+    assert captured[0].get_header("Authorization") == "Basic " + base64.b64encode(b"nuncio:s3cret").decode()
+
+
+def test_apprise_password_is_a_secret_setting():
+    assert "NUNCIO_APPRISE_PASSWORD" in config.SECRET_KEYS
+
+
+def test_apply_changes_rebuilds_delivery_on_apprise_password_change(tmp_path):
+    app, settings = _app_with_data_dir(tmp_path)
+    before = app.engine.delivery
+    config.apply_changes(app, {"NUNCIO_APPRISE_PASSWORD": "rotated"})
+    assert app.engine.delivery is not before
+    app.store.close()
+
+
 def test_build_delivery_wires_retries_into_retrying():
     s = config.load_settings(base_env(NUNCIO_DELIVERY="apprise", NUNCIO_APPRISE_URL="http://apprise:8000/notify/x",
                                        NUNCIO_DELIVERY_RETRIES="5"))
