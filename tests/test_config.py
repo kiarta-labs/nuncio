@@ -591,6 +591,40 @@ def test_apply_changes_live_updates_flap_settings(tmp_path):
         app.store.close()
 
 
+# --- repeat cooldown (NUNCIO_COOLDOWN_S) ---
+
+def test_cooldown_default_is_on_at_1800_seconds():
+    # Deliberately NOT the flap/digest opt-in default: this knob exists to
+    # bound OpenObserve repeat pages, whose keys can never dedupe.
+    s = config.load_settings(base_env())
+    assert s.NUNCIO_COOLDOWN_S == 1800
+
+
+def test_cooldown_setting_lands_in_the_delivery_stage():
+    spec = config.UI_EDITABLE["NUNCIO_COOLDOWN_S"]
+    assert config.stage_for("NUNCIO_COOLDOWN_S", spec) == "deliver"
+
+
+def test_build_app_wires_cooldown_into_the_app(tmp_path):
+    app, settings = config.build_app(config.load_settings(
+        base_env(NUNCIO_DATA_DIR=str(tmp_path), NUNCIO_COOLDOWN_S="900")))
+    try:
+        assert app.cooldown_s == 900.0
+    finally:
+        app.store.close()
+
+
+def test_apply_changes_live_updates_cooldown(tmp_path):
+    s_env = base_env(NUNCIO_DATA_DIR=str(tmp_path))
+    app, settings = config.build_app(config.load_settings(s_env))
+    try:
+        result = config.apply_changes(app, {"NUNCIO_COOLDOWN_S": "0"})
+        assert result["applied"] == ["NUNCIO_COOLDOWN_S"]
+        assert app.cooldown_s == 0.0
+    finally:
+        app.store.close()
+
+
 # --- LOW: Dispatch's contract is "return bool, never raise" ---
 
 def test_dispatch_returns_false_not_raise_on_adapter_exception():

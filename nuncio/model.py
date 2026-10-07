@@ -29,10 +29,21 @@ class ParsedAlert:
     raw_text: str    human-readable one-line-or-few rendering of the native
                      payload; ships on the raw-fallback path and is embedded
                      under every enriched message. Must be meaningful alone.
+    identity: str    OPTIONAL, source-declared EPISODE identity -- a
+                     bucket-free identity for the alert episode (OpenObserve:
+                     "<alert_name>/<stream>").
+                     ONLY the delivery-side repeat cooldown reads it. It must
+                     NOT contain a per-event component: a timestamp/window
+                     start drawn from the payload makes every issuance a new
+                     identity, which is exactly the bug the cooldown exists to
+                     fix. Empty (the default) = this source never participates
+                     in the cooldown. Distinct from `key`, which stays the
+                     per-event idempotency key.
     """
     key: str
     alert: dict
     raw_text: str
+    identity: str = ""
 
 
 # alert dict canonical fields (all optional except host):

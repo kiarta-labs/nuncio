@@ -47,14 +47,21 @@ class Store:
         "host": "TEXT",             # subject metadata -- persist-time, like source/category/severity
         "service": "TEXT",
         "enrich_format": "TEXT",    # structured|text|null -- see nuncio.engine's format ladder (Phase A)
+        "cooldown_key": "TEXT",     # source-scoped, bucket-free EPISODE identity
+                                    # ("openobserve:<alert_name>/<stream>") -- the
+                                    # repeat cooldown's dimension. persist-time
+                                    # metadata, like source/fingerprint/host:
+                                    # NULL for every source that declares no
+                                    # ParsedAlert.identity (see App._cooldown_key)
     }
     # record_stats() may only ever touch the ones NOT already set at
-    # persist() time (source/category/severity/fingerprint/host/service are
-    # persist()'s job) -- keeps the two write paths from racing over the
-    # same columns.
+    # persist() time (source/category/severity/fingerprint/host/service/
+    # cooldown_key are persist()'s job) -- keeps the two write paths from
+    # racing over the same columns.
     _RECORD_STATS_FIELDS = tuple(
         c for c in _STATS_COLUMNS
-        if c not in ("source", "category", "severity", "fingerprint", "host", "service")
+        if c not in ("source", "category", "severity", "fingerprint", "host", "service",
+                     "cooldown_key")
     )
 
     def __init__(self, path, clock=time.time):
@@ -102,6 +109,9 @@ class Store:
         # migration loop above so the column it indexes is guaranteed to exist
         # (a fresh CREATE TABLE doesn't include it; only the loop adds it).
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_fp ON alerts(fingerprint)")
+        # index for the repeat cooldown's clock lookup (cooldown_last) -- also
+        # after the migration loop, for the same reason as idx_alerts_fp.
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_cooldown ON alerts(cooldown_key)")
         # C6: feedback/oversight table -- operator split/merge/confirm-root
         # actions recorded for auditing and for bounded rank corrections (see
         # record_feedback / feedback_corrections). Ingest-independent.
@@ -187,7 +197,7 @@ class Store:
         "severity", "fingerprint", "outcome", "fail_stage", "latency_ms", "llm_ms",
         "tokens_in", "tokens_out", "redaction_count", "bundle_bytes",
         "delivery_mode", "raw_first_fired", "assist_status", "host", "service",
-        "enrich_format",
+        "enrich_format", "cooldown_key",
     )
 
     def status_counts(self):
@@ -253,25 +263,28 @@ class Store:
         return dict(zip(cols, row)) if row else None
 
     def persist(self, key, payload, mode=None, source=None, category=None, severity=None,
-                fingerprint=None, host=None, service=None):
+                fingerprint=None, host=None, service=None, cooldown_key=None):
         """Persist a new alert. Returns True if newly stored, False if the key
         already exists (duplicate — original is left untouched). `mode` is
         the NUNCIO_MODE active at ingest time, recorded for dashboard/audit
         use -- optional, defaults to None for callers that don't track it.
-        `source`/`category`/`severity`/`fingerprint`/`host`/`service` are the
-        alert's own metadata, known at ingest time -- recorded here (not via
-        record_stats()) so even a load-shed row that the engine never sees
-        still shows up correctly on the dashboard's by-source/by-category/
-        by-severity/by-subject breakdowns (and is findable by
-        `fingerprint_stats`). All optional, default None."""
+        `source`/`category`/`severity`/`fingerprint`/`host`/`service`/
+        `cooldown_key` are the alert's own metadata, known at ingest time --
+        recorded here (not via record_stats()) so even a load-shed row that
+        the engine never sees still shows up correctly on the dashboard's
+        by-source/by-category/by-severity/by-subject breakdowns (and is
+        findable by `fingerprint_stats` / `cooldown_last`). All optional,
+        default None: `cooldown_key` is NULL for every source that declares
+        no ParsedAlert.identity.
+        """
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO alerts "
                 "(key, payload, status, seq, created_at, delivery_mode, source, category, severity, "
-                " fingerprint, host, service) "
-                "VALUES (?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM alerts), ?, ?, ?, ?, ?, ?, ?, ?)",
+                " fingerprint, host, service, cooldown_key) "
+                "VALUES (?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM alerts), ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (key, payload, _STATUS_RECEIVED, self._clock(), mode, source, category, severity,
-                 fingerprint, host, service),
+                 fingerprint, host, service, cooldown_key),
             )
             self._conn.commit()
             return cur.rowcount == 1
@@ -450,6 +463,36 @@ class Store:
             ).fetchall()
         return [(r[0], r[1]) for r in rows]
 
+    def cooldown_last(self, cooldown_key, exclude_key=None):
+        """created_at of the NEWEST cell sharing the repeat-cooldown identity
+        `cooldown_key` that was NOT itself suppressed by the cooldown, or None
+        when the identity has never been let through.
+
+        This is the repeat cooldown's clock (see App._maybe_cooldown), and it is
+        deliberately anchored at INGEST, not at delivery: the row that passed
+        the gate is the clock whether it is still queued, in flight, or already
+        delivered. Anchoring on `outcome` instead would let a repeat through
+        whenever it arrived before the previous one finished delivering
+        (batches, load-shed rows, a slow LLM leg), which is precisely the
+        repeat storm this exists to bound.
+
+        `exclude_key` is the row currently being decided -- it is ALREADY
+        persisted when the gate runs, so it must be excluded or the first
+        alert of every identity would suppress itself. Canary keys never carry
+        a cooldown_key, so they cannot pollute this.
+
+        Wall-clock `created_at` (Store._clock) throughout -- never pass a
+        monotonic App clock here."""
+        sql = ("SELECT MAX(created_at) FROM alerts "
+               "WHERE cooldown_key = ? AND status <> 'delivered_suppressed_cooldown'")
+        params = [cooldown_key]
+        if exclude_key is not None:
+            sql += " AND key <> ?"
+            params.append(exclude_key)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return row[0] if row and row[0] is not None else None
+
     def claim_assist(self, key):
         """Atomic CAS claim of `key` for the assist worker, moving
         `assist_status` to `'in_flight'` -- but ONLY if it is still
@@ -548,12 +591,36 @@ class Store:
     # ALTER TABLE migrations) purely for historical/audit continuity with
     # rows written before the delivery-mode collapse; nothing in this build
     # writes to `raw_first_fired` anymore.
-    # "suppressed_flap" (Batch 2 item G): a flap-suppressed repeat is a
-    # TERMINAL state -- persisted and auditable, but never delivered and
-    # never eligible for the maintenance safety net's raw fallback (it must
-    # not be picked up by undelivered_older_than, which only selects
-    # status == 'received').
-    _MARK_MODES = ("enriched", "raw", "suppressed_flap")
+    # "suppressed_flap" (Batch 2 item G) / "suppressed_cooldown": a suppressed
+    # repeat is a TERMINAL state -- persisted and auditable, but never
+    # delivered and never eligible for the maintenance safety net's raw
+    # fallback (it must not be picked up by undelivered_older_than, which only
+    # selects status == 'received'). Both are reaped by purge_delivered's
+    # LIKE 'delivered_%'.
+    _MARK_MODES = ("enriched", "raw", "suppressed_flap", "suppressed_cooldown")
+
+    def mark_suppressed_cooldown(self, key):
+        """Terminal CAS for a repeat suppressed by the delivery-side repeat
+        cooldown: status -> 'delivered_suppressed_cooldown'.
+
+        Same shape/contract as mark_digested: CAS from 'received' only, so a
+        row the worker or the maintenance sweep already moved on is left
+        untouched and the caller falls through to the normal path. Terminal and
+        auditable -- invisible to undelivered()/undelivered_older_than (both
+        select only 'received') and reaped by purge_delivered.
+
+        The suppression is countable after a restart because it lives in the
+        row (cooldown_key + this status + the outcome the caller records); the
+        process-lifetime nuncio_suppressed_cooldown_total only covers the
+        current run."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE alerts SET status = 'delivered_suppressed_cooldown' "
+                "WHERE key = ? AND status = 'received'",
+                (key,),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
 
     def mark_digested(self, key):
         """Fold one alert into its digest window: status -> 'delivered_digested'.

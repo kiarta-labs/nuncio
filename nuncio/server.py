@@ -102,6 +102,11 @@ class Metrics:
         # Q2: alerts folded into a digest window instead of enriched
         # individually (status delivered_digested in the store).
         self.digested = 0
+        # Repeat cooldown: same-identity repeats suppressed at ingest inside
+        # NUNCIO_COOLDOWN_S (status delivered_suppressed_cooldown). The
+        # durable count is the rows themselves; this counter is the
+        # current-process view of it.
+        self.suppressed_cooldown = 0
         # Deep-RCA budget pass: LLM calls abandoned at their hard wall-clock
         # bound (`Engine._call_bounded`'s TimeoutError branch -- the thread
         # leaks until the socket timeout, so this is the one signal that
@@ -147,6 +152,7 @@ class Metrics:
             lines.append(f"nuncio_purged_stale_received_total {self.purged_stale_received}")
             lines.append(f"nuncio_llm_abandoned_total {self.llm_abandoned}")
             lines.append(f"nuncio_digested_total {self.digested}")
+            lines.append(f"nuncio_suppressed_cooldown_total {self.suppressed_cooldown}")
             if self.breaker is not None:
                 lines.append(f"nuncio_llm_breaker_trips_total {self.breaker.trips}")
                 for st in ("closed", "half_open", "open"):
@@ -221,7 +227,13 @@ class App:
                   # window (NUNCIO_DIGEST_WINDOW_S). 0.0 disables -- a
                   # hand-built App that doesn't pass this behaves exactly
                   # like before (every alert enriched individually).
-                  digest_window_s=0.0):
+                  digest_window_s=0.0,
+                  # Repeat cooldown (NUNCIO_COOLDOWN_S): same-identity repeats
+                  # inside this window are persisted + terminally marked but
+                  # never queued/delivered. 0 disables -- hand-built Apps
+                  # (tests) stay off unless they opt in; config.build_app
+                  # passes the configured production value.
+                  cooldown_s=0.0):
         self.engine = engine
         self.store = store
         self.metrics = metrics
@@ -243,6 +255,7 @@ class App:
         self.full_budget_s = full_budget_s
         self.private_trusted = private_trusted
         self.digest_window_s = digest_window_s or 0.0
+        self.cooldown_s = cooldown_s or 0.0
         # Q2 digest state: fingerprint -> {"first_at", "keys", "lines",
         # "service", "host", "category"}. In-memory ONLY (never persisted):
         # a restart loses open windows, and the next arrival starts a fresh
@@ -378,7 +391,9 @@ class App:
                 newly = self.store.persist(pa.key, raw, mode=mode, source=source_name,
                                             category=category, severity=severity,
                                             fingerprint=fp, host=host,
-                                            service=service)  # fsync'd before we return
+                                            service=service,
+                                            cooldown_key=self._cooldown_key(
+                                                source_name, getattr(pa, "identity", "")))  # fsync'd before we return
             except Exception:
                 self.metrics.inc("failures", "persist")
                 status = 500  # source should retry the whole batch
@@ -388,6 +403,15 @@ class App:
             if not newly:
                 self.metrics.inc("duplicates")
                 continue  # duplicate -- already handled/queued
+            # Repeat cooldown: a repeat of one alert IDENTITY (source +
+            # adapter-declared identity, e.g. OpenObserve's
+            # "<alert_name>/<stream>") arriving inside NUNCIO_COOLDOWN_S of the
+            # last non-suppressed row of that identity is persisted and
+            # terminally marked, but never queued -- no LLM spend, no page.
+            # Here (before the storm bump) so a suppressed repeat is not
+            # counted as ingest pressure either. Fail-OPEN.
+            if self._maybe_cooldown(source_name, pa.key, getattr(pa, "identity", "")):
+                continue
             # C4: record this ingest against the storm rate tracker (after
             # the duplicate gate -- only genuinely-new alerts count).
             try:
@@ -470,6 +494,61 @@ class App:
         except Exception:
             log.warning("digest sweep failed", exc_info=True)
         return status
+
+    @staticmethod
+    def _cooldown_key(source_name, identity):
+        """Source-scoped cooldown identity, or None when the adapter declared
+        none (every source but OpenObserve today). Prefixing the source keeps
+        two different sources that happen to declare the same identity string
+        from sharing one cooldown window. `identity` comes from the payload, so
+        nothing here may assume it is delimiter-free -- it is only ever compared
+        verbatim (parameterized SQL), never parsed."""
+        identity = (identity or "").strip()
+        return f"{source_name}:{identity}" if identity else None
+
+    def _maybe_cooldown(self, source_name, key, identity):
+        """Repeat-cooldown decision for ONE freshly-persisted alert. Returns
+        True when the alert was suppressed (status now
+        delivered_suppressed_cooldown -- the caller must NOT queue it), False
+        for everything else (first of an identity, an identity-less source,
+        window expired, cooldown disabled, any error).
+
+        The window is measured from the identity's newest NON-suppressed row
+        (store.cooldown_last), so the alert that passes the gate IS the new
+        clock and one unresolved episode pages at most once per window -- a
+        rate bound, not a mute, and independent of how long delivery takes.
+
+        Fail-OPEN by construction: a cooldown that cannot read its own clock
+        must never delay or drop an alert -- the never-lose invariant outranks
+        the cooldown (same rule as Engine._flap_decision). `exclude_key=key`
+        because this row is already persisted."""
+        try:
+            window = self.cooldown_s or 0
+            if not (window > 0):
+                return False
+            ckey = self._cooldown_key(source_name, identity)
+            if not ckey:
+                return False
+            # Store wall clock only -- App.clock is monotonic and comparing it
+            # to created_at would silently no-op the feature.
+            last = self.store.cooldown_last(ckey, exclude_key=key)
+            if last is None or (self.wall_clock() - last) >= window:
+                return False
+            held = self.store.mark_suppressed_cooldown(key)
+            if not held:
+                # CAS lost -- the row already moved on (worker/maintenance won
+                # a race). Fall through to the normal path, as mark_digested does.
+                return False
+            try:
+                self.store.record_stats(key, outcome="suppressed_cooldown")
+            except Exception:
+                pass  # the status alone is enough for the terminal state
+            self.metrics.inc("suppressed_cooldown")
+            log.info("repeat cooldown: suppressed %s (%ss window)", ckey, window)
+            return True
+        except Exception:
+            log.warning("repeat cooldown check failed -- delivering", exc_info=True)
+            return False
 
     def _maybe_digest(self, source_name, key, raw, mode, severity, host):
         """Q2c coalescing decision for one freshly-persisted alert. Returns

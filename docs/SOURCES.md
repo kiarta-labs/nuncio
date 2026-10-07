@@ -4,6 +4,12 @@ A source adapter maps one native monitoring-tool webhook payload to a list of ca
 
 Nuncio ships adapters for CheckMK, Grafana, Prometheus Alertmanager, and OpenObserve, plus a `generic` fallback for anything that doesn't have one.
 
+### The optional `identity` (repeat cooldown)
+
+`ParsedAlert.identity` is an OPTIONAL, bucket-free identity for the alert *episode* — everything but the per-event part. Only the delivery-side repeat cooldown (`NUNCIO_COOLDOWN_S`) reads it, and returning `""` (the default) means your source never participates: nothing about your source's behaviour changes.
+
+Declare one when the same unresolved problem reaches Nuncio more than once under different event keys. OpenObserve is the canonical case: its payload carries the evaluation's query-window start, so the idempotency key `openobserve:<alert_name>/<stream>/<start_time>` changes on every re-evaluation and can never dedupe. Its identity is therefore `<alert_name>/<stream>`. Include a per-event component (a timestamp, a sequence, the raw payload) and the cooldown degenerates to no-op — that is the bug, not the fix. Delimiters in the value are fine: identity is only ever compared verbatim against itself (within the same source), never parsed.
+
 ## The interface
 
 ```python

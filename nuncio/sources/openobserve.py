@@ -153,4 +153,10 @@ class OpenObserve(SourceAdapter):
         bucket = start_time or str(int(_clock() // 60))
         key = f"{self.name}:{alert_name}/{stream}/{bucket}"
         raw = f"[{stream}] {alert_name} — {message or '(no message)'}"
-        return [ParsedAlert(key=key, alert=alert, raw_text=raw)]
+        # `key` keeps the per-evaluation window start (store PK / idempotency /
+        # display); `identity` is the bucket-free EPISODE identity the
+        # delivery-side repeat cooldown keys on. The window start is recomputed
+        # on every evaluation of one unresolved episode, so a key-based dedup
+        # can never collapse a repeat -- see App._maybe_cooldown.
+        return [ParsedAlert(key=key, alert=alert, raw_text=raw,
+                            identity=f"{alert_name}/{stream}")]

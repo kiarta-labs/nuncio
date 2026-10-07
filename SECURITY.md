@@ -34,3 +34,9 @@ Nuncio is designed to fail safe and to keep alert content private:
   a reverse proxy or IP allowlist. Exposing them directly to an untrusted
   network is a deployment mistake, not a Nuncio vulnerability — but a way to
   bypass the redactor or the admin-token write gate is in scope.
+- The repeat cooldown (`NUNCIO_COOLDOWN_S`) is a *suppression* primitive
+  reachable from `/ingest/*`: a caller who can post an identity-bearing payload
+  (OpenObserve is the only one today) can advance that identity's clock and
+  suppress a genuine page for up to the cooldown window. Ingest auth is optional
+  (`NUNCIO_INGEST_TOKEN`) and off by default, so **run with a token if the
+  cooldown is enabled and the port is reachable by anything you do not trust**.

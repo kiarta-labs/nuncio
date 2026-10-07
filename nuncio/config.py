@@ -120,6 +120,9 @@ _SCHEMA = {
     "NUNCIO_FLAP_THRESHOLD": (0, int),
     "NUNCIO_FLAP_WINDOW_S": (10800, int),
     "NUNCIO_FLAP_COOLDOWN_S": (3600, int),
+    # Repeat cooldown: unlike the flap/digest knobs above this defaults ON --
+    # see the UI_EDITABLE help. 0 disables.
+    "NUNCIO_COOLDOWN_S": (1800, int),
     "NUNCIO_MODE": ("enriched", str),
     "NUNCIO_DATA_DIR": ("/data", str),
     "NUNCIO_PORT": (8095, int),
@@ -364,6 +367,17 @@ UI_EDITABLE = {
                                     help="Once flapping is detected, subsequent same-fingerprint alerts are "
                                          "persisted with outcome=suppressed_flap (never delivered) for this "
                                          "long."),
+    "NUNCIO_COOLDOWN_S": _spec("NUNCIO_COOLDOWN_S", category="live", type="int", min=0, max=604800,
+                               group="delivery", label="Repeat-suppression cooldown (seconds)",
+                               help="Repeats of ONE alert identity -- the source's own alert name plus "
+                                    "stream (OpenObserve is the only source that declares one today) -- "
+                                    "inside this window are persisted as delivered_suppressed_cooldown "
+                                    "and never delivered, so one unresolved episode pages at most once "
+                                    "per window. 0 disables. UNLIKE flap/digest this defaults ON (1800): "
+                                    "it exists because OpenObserve recomputes its query-window start on "
+                                    "every evaluation, so its repeat pages can never be collapsed by the "
+                                    "idempotency key. Enabling it changes delivery semantics, and only "
+                                    "for sources that declare an identity."),
     "NUNCIO_EVIDENCE_MAX_BYTES": _spec("NUNCIO_EVIDENCE_MAX_BYTES", category="live", type="int", min=1000, max=500000,
                                        group="delivery", label="Evidence section cap (bytes)",
                                        help="Cap on the labeled evidence sections (logs/metrics/container state/"
@@ -1615,6 +1629,11 @@ def apply_changes(app, set_map, reset_list=None):
             engine.flap_window_s = candidate.NUNCIO_FLAP_WINDOW_S
         if "NUNCIO_FLAP_COOLDOWN_S" in live_changed:
             engine.flap_cooldown_s = candidate.NUNCIO_FLAP_COOLDOWN_S
+        if "NUNCIO_COOLDOWN_S" in live_changed:
+            # Read per-ingest from the App attribute (no component rebuild) --
+            # same shape as NUNCIO_DIGEST_WINDOW_S below, NOT the engine-side
+            # flap keys above (this gate lives on App.ingest).
+            app.cooldown_s = float(candidate.NUNCIO_COOLDOWN_S)
         if "NUNCIO_RETENTION_DAYS" in live_changed:
             app.retention_s = candidate.NUNCIO_RETENTION_DAYS * 86400
         if "NUNCIO_INGEST_TOKEN" in live_changed:
@@ -2207,6 +2226,7 @@ def build_app(settings=None, clock=None):
         clock=clock, retention_s=settings.NUNCIO_RETENTION_DAYS * 86400,
         full_budget_s=settings.effective_full_budget_s,
         digest_window_s=float(settings.NUNCIO_DIGEST_WINDOW_S),
+        cooldown_s=float(settings.NUNCIO_COOLDOWN_S),
         private_trusted=settings.private_trusted,
         token=settings.NUNCIO_INGEST_TOKEN or None,
         default_source=settings.NUNCIO_DEFAULT_SOURCE,

@@ -12,6 +12,20 @@ De-duplicating noisy alerts (e.g. collapsing a flood of near-identical pages
 into one) is the monitoring source's job (CheckMK/Alertmanager grouping,
 Grafana notification policies, etc.), not Nuncio's.
 
+There are exactly three narrow, deliberate exceptions to that rule, and they are
+all *bounded* — each leaves a durable, auditable row behind and each fails open:
+
+- flap suppression (`NUNCIO_FLAP_THRESHOLD`) — a fingerprint that alternates
+  problem/ok past a threshold is held for a cooldown,
+- digest (`NUNCIO_DIGEST_WINDOW_S`) — generic info/ok notices coalesce into one,
+- repeat cooldown (`NUNCIO_COOLDOWN_S`) — repeats of one source-declared
+  *identity* inside a window are persisted but not delivered.
+
+The repeat cooldown exists because the source-side remedy is not always
+available: OpenObserve's destination payload carries the evaluation's
+query-window start, so its per-event key changes on every re-evaluation of the
+same unresolved episode and grouping cannot happen upstream of Nuncio.
+
 `signature()`/`fingerprint()` never raise: on any error `signature()` degrades
 to `""` and `fingerprint()` degrades to `None`.
 """
