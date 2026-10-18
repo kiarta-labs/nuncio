@@ -131,6 +131,8 @@ _SCHEMA = {
     "NUNCIO_DEFAULT_SOURCE": ("generic", str),
     "NUNCIO_EXTRA_SOURCES": ("", str),
     "NUNCIO_DIGEST_WINDOW_S": (0, int),
+    "NUNCIO_FANOUT_WINDOW_S": (0, int),
+    "NUNCIO_FANOUT_K": (3, int),
     "NUNCIO_BUDGET_S": (30.0, float),
     "NUNCIO_ENRICH_DEPTH": ("full", str),
     "NUNCIO_FULL_BUDGET_S": (60.0, float),
@@ -486,6 +488,20 @@ UI_EDITABLE = {
                                          "instead of N enrichments; 0 (default) disables. The first "
                                          "notice always goes out immediately. Opt-in: enabling changes "
                                          "delivery semantics (repeats become one digest)."),
+    "NUNCIO_FANOUT_WINDOW_S": _spec("NUNCIO_FANOUT_WINDOW_S", category="live", type="int", min=0, max=86400,
+                                    group="ingest", label="Fan-out digest window (s)",
+                                    help="Alerts sharing a (source, rule, lifecycle state, severity) "
+                                         "group inside this window: the first NUNCIO_FANOUT_K go out "
+                                         "individually, everything after is folded into ONE summary "
+                                         "when the window closes. Groups by RULE identity, not host, "
+                                         "so one rule alarming across many objects (a per-container "
+                                         "restart sweep) collapses instead of paging per instance. "
+                                         "0 (default) disables; criticals are never held."),
+    "NUNCIO_FANOUT_K": _spec("NUNCIO_FANOUT_K", category="live", type="int", min=1, max=100,
+                             group="ingest", label="Fan-out digest first-K",
+                             help="How many alerts of a fan-out group inside the window are sent "
+                                  "individually before the rest are coalesced into the window's "
+                                  "summary. Only used when NUNCIO_FANOUT_WINDOW_S is above 0."),
 
     # --- Storage & retention ---
     "NUNCIO_RETENTION_DAYS": _spec("NUNCIO_RETENTION_DAYS", category="live", type="int", min=1, max=3650,
@@ -1644,6 +1660,12 @@ def apply_changes(app, set_map, reset_list=None):
             # Read per-ingest from the App attribute (no component rebuild:
             # the window only gates the digest decision in App.ingest).
             app.digest_window_s = float(candidate.NUNCIO_DIGEST_WINDOW_S)
+        if "NUNCIO_FANOUT_WINDOW_S" in live_changed:
+            # Same shape as NUNCIO_DIGEST_WINDOW_S above: gates App.ingest's
+            # fan-out decision only, so a live flip needs no rebuild.
+            app.fanout_window_s = float(candidate.NUNCIO_FANOUT_WINDOW_S)
+        if "NUNCIO_FANOUT_K" in live_changed:
+            app.fanout_k = max(1, int(candidate.NUNCIO_FANOUT_K))
         if "NUNCIO_LOG_LEVEL" in live_changed:
             logging.getLogger().setLevel(getattr(logging, candidate.NUNCIO_LOG_LEVEL.upper(), logging.INFO))
 
@@ -2227,6 +2249,8 @@ def build_app(settings=None, clock=None):
         full_budget_s=settings.effective_full_budget_s,
         digest_window_s=float(settings.NUNCIO_DIGEST_WINDOW_S),
         cooldown_s=float(settings.NUNCIO_COOLDOWN_S),
+        fanout_window_s=float(settings.NUNCIO_FANOUT_WINDOW_S),
+        fanout_k=int(settings.NUNCIO_FANOUT_K),
         private_trusted=settings.private_trusted,
         token=settings.NUNCIO_INGEST_TOKEN or None,
         default_source=settings.NUNCIO_DEFAULT_SOURCE,

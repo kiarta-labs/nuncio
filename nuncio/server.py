@@ -102,6 +102,10 @@ class Metrics:
         # Q2: alerts folded into a digest window instead of enriched
         # individually (status delivered_digested in the store).
         self.digested = 0
+        # Fan-out digest: summaries emitted for closed fan-out windows whose
+        # group exceeded NUNCIO_FANOUT_K (the folded alerts themselves are
+        # counted by `digested` above -- same terminal status).
+        self.fanout_summaries = 0
         # Repeat cooldown: same-identity repeats suppressed at ingest inside
         # NUNCIO_COOLDOWN_S (status delivered_suppressed_cooldown). The
         # durable count is the rows themselves; this counter is the
@@ -152,6 +156,7 @@ class Metrics:
             lines.append(f"nuncio_purged_stale_received_total {self.purged_stale_received}")
             lines.append(f"nuncio_llm_abandoned_total {self.llm_abandoned}")
             lines.append(f"nuncio_digested_total {self.digested}")
+            lines.append(f"nuncio_fanout_summaries_total {self.fanout_summaries}")
             lines.append(f"nuncio_suppressed_cooldown_total {self.suppressed_cooldown}")
             if self.breaker is not None:
                 lines.append(f"nuncio_llm_breaker_trips_total {self.breaker.trips}")
@@ -233,7 +238,14 @@ class App:
                   # never queued/delivered. 0 disables -- hand-built Apps
                   # (tests) stay off unless they opt in; config.build_app
                   # passes the configured production value.
-                  cooldown_s=0.0):
+                  cooldown_s=0.0,
+                  # Fan-out digest (NUNCIO_FANOUT_WINDOW_S / NUNCIO_FANOUT_K):
+                  # one rule alerting across many objects (a per-container
+                  # restart sweep) inside this window collapses to its first
+                  # NUNCIO_FANOUT_K delivered individually plus ONE summary.
+                  # 0.0 (default) disables -- same opt-in, fail-open posture
+                  # as the generic digest above.
+                  fanout_window_s=0.0, fanout_k=3):
         self.engine = engine
         self.store = store
         self.metrics = metrics
@@ -256,6 +268,8 @@ class App:
         self.private_trusted = private_trusted
         self.digest_window_s = digest_window_s or 0.0
         self.cooldown_s = cooldown_s or 0.0
+        self.fanout_window_s = fanout_window_s or 0.0
+        self.fanout_k = max(1, int(fanout_k or 3))
         # Q2 digest state: fingerprint -> {"first_at", "keys", "lines",
         # "service", "host", "category"}. In-memory ONLY (never persisted):
         # a restart loses open windows, and the next arrival starts a fresh
@@ -263,6 +277,12 @@ class App:
         # RLock: sweeps emit via self.ingest, which re-enters this lock.
         self._digest = {}
         self._digest_lock = threading.RLock()
+        # Fan-out digest state: (source, rule identity, state, severity) ->
+        # {"first_at", "count", "keys", "lines", "links", ...}. In-memory
+        # ONLY, same restart contract as the generic digest above: held rows
+        # are terminally recorded, the window state is not (fail-open).
+        # Shares _digest_lock (an RLock; sweeps re-enter via self.ingest).
+        self._fanout = {}
         self.clock = clock
         self.wall_clock = wall_clock
         self.maint_interval = maint_interval
@@ -426,6 +446,14 @@ class App:
             if self._maybe_digest(source_name, pa.key, raw, mode, severity,
                                   host):
                 continue
+            # Fan-out digest: one rule alerting across many objects folds to
+            # its first NUNCIO_FANOUT_K (delivered individually, above and
+            # below) plus one summary per window. Runs AFTER the generic
+            # digest (which already returned False when it did not fold), so
+            # the two layers never double-hold one alert.
+            if self._maybe_fanout(source_name, pa, pa.key, raw, mode, severity,
+                                  host, service):
+                continue
             # BLOCKER 1 (Phase B): `depth` is captured HERE, at ingest, and
             # the Deadline is built from the MATCHING budget for that depth
             # -- `full_budget_s` for a full-depth alert, `budget_s`
@@ -493,6 +521,10 @@ class App:
             self._sweep_digests()
         except Exception:
             log.warning("digest sweep failed", exc_info=True)
+        try:
+            self._sweep_fanouts()
+        except Exception:
+            log.warning("fan-out digest sweep failed", exc_info=True)
         return status
 
     @staticmethod
@@ -657,6 +689,133 @@ class App:
         except Exception:
             log.warning("digest emit failed", exc_info=True)
 
+    @staticmethod
+    def _fanout_identity(alert, host, service):
+        """Rule identity for fan-out grouping: the parsed alert's `service`
+        (Grafana/Alertmanager alertname, CheckMK service description, O2
+        alert name), else the host -- deliberately NOT the per-instance
+        fingerprint, which is exactly what fans out."""
+        if isinstance(service, str) and service.strip():
+            return service.strip()
+        if isinstance(alert, dict):
+            v = alert.get("alertname")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return host or "-"
+
+    def _maybe_fanout(self, source_name, pa, key, raw, mode, severity, host,
+                      service):
+        """Fan-out coalescing decision for one freshly-persisted alert.
+        Returns True when the alert was folded into its open fan-out window
+        (status now delivered_digested -- the caller must NOT queue it).
+        Returns False for the first NUNCIO_FANOUT_K alerts of a group (they
+        take the normal path, so the operator learns at once) and for
+        everything ineligible.
+
+        Grouping key is (source, rule identity, lifecycle state, severity):
+        one rule alarming across many objects shares a group, while a
+        different rule -- or the firing -> resolved flip -- forms its own
+        group with its own first-K. Criticals are NEVER held. In-memory
+        ONLY: a restart loses open windows and the next arrival starts a
+        fresh one; held rows stay terminally recorded, so nothing already
+        announced by the first-K (or anything else) is lost (fail-open)."""
+        window = self.fanout_window_s or 0
+        if not (window > 0 and mode == "enriched" and severity != "critical"):
+            return False
+        alert = pa.alert if isinstance(pa.alert, dict) else {}
+        state = (alert.get("state") or "").strip().lower() if isinstance(alert.get("state"), str) else ""
+        group = (source_name, self._fanout_identity(alert, host, service),
+                 state, severity or "unknown")
+        now = self.wall_clock()
+        _first = (raw or "").strip().splitlines()
+        _line = (_first[0][:160] if _first else "(empty)")
+        with self._digest_lock:
+            due = self._sweep_fanouts_locked(now)
+            ent = self._fanout.get(group)
+            if ent is None:
+                links = alert.get("links") if isinstance(alert.get("links"), list) else []
+                ent = {"first_at": now, "count": 0, "keys": [], "lines": [],
+                       "severity": severity or "unknown", "state": state,
+                       "identity": group[1], "links": links[:3]}
+                self._fanout[group] = ent
+            ent["count"] += 1
+            if len(ent["keys"]) < self._FANOUT_MAX_KEYS:
+                ent["keys"].append(key)
+            if len(ent["lines"]) < self._FANOUT_MAX_LINES:
+                ent["lines"].append(_line)
+            over = ent["count"] > self.fanout_k
+        for _expired_group, expired in due:
+            self._emit_fanout_summary(expired)
+        if not over:
+            return False
+        try:
+            held = self.store.mark_digested(key)
+        except Exception:
+            held = False
+        if not held:
+            # CAS lost -- the row already moved on (worker/maintenance won a
+            # race). Fall through to the normal path; the worker's
+            # status != received guard makes that a safe no-op.
+            return False
+        self.metrics.inc("digested")
+        return True
+
+    def _sweep_fanouts_locked(self, now):
+        """Pop expired fan-out windows (and the oldest window past the group
+        cap). Caller holds _digest_lock. Returns [(group, entry)] for the
+        caller to emit AFTER releasing the lock."""
+        window = self.fanout_window_s or 0
+        if window <= 0 or not self._fanout:
+            return []
+        due = [(group, ent) for group, ent in self._fanout.items()
+               if now - ent["first_at"] >= window]
+        for group, _ent in due:
+            del self._fanout[group]
+        if len(self._fanout) >= self._FANOUT_MAX_GROUPS:
+            oldest = min(self._fanout, key=lambda k: self._fanout[k]["first_at"])
+            due.append((oldest, self._fanout.pop(oldest)))
+        return due
+
+    def _sweep_fanouts(self):
+        """Emit all expired fan-out windows. Called at the ingest tail and
+        once per maintenance pass; never raises (_emit_fanout_summary never
+        raises)."""
+        now = self.wall_clock()
+        with self._digest_lock:
+            due = self._sweep_fanouts_locked(now)
+        for _expired_group, expired in due:
+            self._emit_fanout_summary(expired)
+
+    def _emit_fanout_summary(self, entry):
+        """One summary for a closed fan-out window whose group exceeded K.
+        Re-enters ingest as an ordinary generic notice (the same path the
+        generic digest uses) carrying the group's severity -- criticals never
+        reach here, so the summary is never itself a held class. Best-effort
+        throughout: a failure here must never break the sweep caller (the
+        held rows are already terminally recorded; only the summary is
+        lost)."""
+        try:
+            count = int(entry.get("count") or 0)
+            if count <= self.fanout_k:
+                return  # every alert of the group went out individually
+            lines = entry.get("lines") or []
+            state = (entry.get("state") or "").upper()
+            label = f"{entry.get('identity') or '-'}{(' ' + state) if state else ''}"
+            body = [f"{label} x{count} ({entry.get('severity') or 'unknown'}) - "
+                    f"first {self.fanout_k} sent individually, "
+                    f"{count - self.fanout_k} coalesced"]
+            body += [f"- {ln}" for ln in lines[:10]]
+            if len(lines) > 10:
+                body.append(f"(+{len(lines) - 10} more)")
+            for lnk in (entry.get("links") or [])[:3]:
+                body.append(f"link: {lnk}")
+            payload = {"message": "\n".join(body),
+                       "severity": entry.get("severity") or "info"}
+            self.ingest("generic", payload)
+            self.metrics.inc("fanout_summaries")
+        except Exception:
+            log.warning("fan-out summary emit failed", exc_info=True)
+
     def _worker(self):
         while True:
             _prio, _seq, key, alert, raw, raw_full, deadline, mode, depth, trusted, provider_at_ingest = self.q.get()
@@ -712,6 +871,13 @@ class App:
     _DIGEST_MAX_FPS = 512
     _DIGEST_MAX_LINES = 50
     _DIGEST_MAX_KEYS = 128
+    # Fan-out digest bounds: groups are (source, rule, state, severity).
+    # Keys must tolerate a full sweep of instances (103 containers observed
+    # in the wild), hence the larger key cap; lines/keys bound memory only --
+    # overflow still counts the arrival and emits the oldest window early.
+    _FANOUT_MAX_GROUPS = 512
+    _FANOUT_MAX_LINES = 50
+    _FANOUT_MAX_KEYS = 1024
     # C4 storm-mode constants. Trips when >= _STORM_RATE alerts land within a
     # 60s span; stays active for _STORM_ACTIVE_S after the last trip. Not
     # settings knobs (deliberately CONNECTED to Q2's digest+priority work:
@@ -850,6 +1016,11 @@ class App:
             # must never starve the other duties).
             try:
                 self._sweep_digests()
+            except Exception:
+                self.metrics.inc("failures", "maintenance")
+            # Fan-out digest: same contract, own isolation.
+            try:
+                self._sweep_fanouts()
             except Exception:
                 self.metrics.inc("failures", "maintenance")
             assist = getattr(self.engine, "assist", None)
